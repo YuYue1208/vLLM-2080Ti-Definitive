@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import platform
 import uuid
 
 import torch
@@ -47,3 +49,41 @@ def is_moe_layer(module: torch.nn.Module) -> bool:
                 return True
 
     return _check_bases(module.__class__)
+
+
+def get_system_config() -> dict:
+    """
+    Get the current system configuration including CPU, memory, and GPU info.
+    
+    Returns:
+        A dictionary containing system configuration details.
+    """
+    config = {
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count(),
+        "memory_total_gb": None,
+        "gpu_count": 0,
+        "gpu_names": [],
+    }
+
+    # Get total memory in GB
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    mem_kb = int(line.split()[1])
+                    config["memory_total_gb"] = round(mem_kb / (1024 ** 2), 2)
+                    break
+    except Exception:
+        pass
+
+    # Get GPU info if CUDA is available
+    if torch.cuda.is_available():
+        config["gpu_count"] = torch.cuda.device_count()
+        config["gpu_names"] = [
+            torch.cuda.get_device_name(i) for i in range(config["gpu_count"])
+        ]
+    else:
+        config["gpu_names"] = ["No GPU available"]
+
+    return config
