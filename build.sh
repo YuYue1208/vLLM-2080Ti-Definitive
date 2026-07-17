@@ -32,7 +32,6 @@ BUILD_PREFLIGHT_TIMEOUT_SECONDS=${BUILD_PREFLIGHT_TIMEOUT_SECONDS:-$BUILD_PREFLI
 BUILD_PYPI_PRIMARY_TIMEOUT_SECONDS=${BUILD_PYPI_PRIMARY_TIMEOUT_SECONDS:-60}
 BUILD_GIT_PRIMARY_TIMEOUT_SECONDS=${BUILD_GIT_PRIMARY_TIMEOUT_SECONDS:-120}
 BUILD_GIT_MIRROR_PREFIXES=${BUILD_GIT_MIRROR_PREFIXES:-https://gh-proxy.com/ https://ghfast.top/}
-TOTAL_STEPS=15
 STEP_INDEX=0
 BUILD_STARTED_AT=$(date +%s)
 VERSION=${VERSION:-$FORK_RELEASE}
@@ -77,13 +76,72 @@ detect_cpu_threads() {
   echo "$threads"
 }
 
+detect_memory_gb() {
+  local mem_kb mem_gb
+  mem_kb=$(awk '/MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+  mem_gb=$(( mem_kb / 1024 / 1024 ))
+  if (( mem_gb < 1 )); then
+    mem_gb=1
+  fi
+  echo "$mem_gb"
+}
+
 select_max_jobs() {
   local threads=$1
-  if (( threads <= 4 )); then
-    echo "$threads"
-  else
-    echo "$((threads - 2))"
+  local mem_gb=$2
+  local reserve_gb=3
+  local per_job_gb=3
+  local mem_limited_jobs
+
+  mem_limited_jobs=$(( (mem_gb - reserve_gb) / per_job_gb ))
+  (( mem_limited_jobs >= 1 )) || mem_limited_jobs=1
+  (( mem_limited_jobs <= threads )) || mem_limited_jobs=$threads
+
+  echo "$mem_limited_jobs"
+}
+
+validate_max_jobs_range() {
+  local jobs=$1
+  local threads=$2
+  is_positive_integer "$jobs" || fail "MAX_JOBS must be a positive integer."
+  if (( jobs < 1 || jobs > threads )); then
+    fail "MAX_JOBS must be between 1 and CPU_THREADS ($threads)."
   fi
+}
+
+configure_build_parallelism() {
+  local answer
+
+  if [[ "$MAX_JOBS_SOURCE" != "auto" ]]; then
+    return 0
+  fi
+  if [[ "${ASSUME_YES:-0}" == "1" || "${YES:-0}" == "1" || ! -t 0 ]]; then
+    return 0
+  fi
+
+  cat <<EOF
+
+Build thread selection:
+  CPU threads detected: $CPU_THREADS
+  Recommended build threads: $MAX_JOBS
+  Allowed range: 1-$CPU_THREADS
+
+Press Enter to use the recommended value, or type a build thread count:
+EOF
+
+  while true; do
+    read -r answer
+    if [[ -z "$answer" ]]; then
+      return 0
+    fi
+    if is_positive_integer "$answer" && (( answer >= 1 && answer <= CPU_THREADS )); then
+      MAX_JOBS="$answer"
+      MAX_JOBS_SOURCE=manual-prompt
+      export MAX_JOBS
+      return 0
+    fi
+    echo "Please enter a number from 1 to $CPU_THREADS, or press Enter for $MAX_JOBS:"
+  done
 }
 
 validate_cuda_dev_files() {
@@ -110,6 +168,41 @@ validate_cuda_dev_files() {
   fi
 }
 
+reset_stale_fetchcontent_subbuilds() {
+  local stale_dir
+  local -a dirs=(
+    "$FLASHQLA_DIR/../cutlass-subbuild"
+    "$FLASHQLA_DIR/../deepgemm-subbuild"
+    "$FLASHQLA_DIR/../triton_kernels-subbuild"
+    "$FLASHQLA_DIR/../cutlass-build"
+    "$FLASHQLA_DIR/../deepgemm-build"
+    "$FLASHQLA_DIR/../triton_kernels-build"
+  )
+
+  for stale_dir in "${dirs[@]}"; do
+    if [[ -e "$stale_dir/CMakeCache.txt" ]]; then
+      echo "Preflight: removing stale FetchContent cache at $stale_dir"
+      rm -rf "$stale_dir"
+    fi
+  done
+}
+
+dir_has_entries() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .
+}
+
+refresh_empty_checkout() {
+  local checkout_dir=$1
+  local expected_path=$2
+
+  if [[ -d "$checkout_dir/.git" ]] && ! dir_has_entries "$expected_path"; then
+    echo "Preflight: $expected_path is empty; refreshing checkout at $checkout_dir"
+    rm -rf "$checkout_dir"
+  fi
+}
+
 confirm_install() {
   if [[ "${ASSUME_YES:-0}" == "1" || "${YES:-0}" == "1" ]]; then
     return 0
@@ -128,6 +221,7 @@ Expected time:
 
 Build parallelism:
   CPU threads: $CPU_THREADS
+  System memory: ${MEMORY_GB}GB
   MAX_JOBS: $MAX_JOBS ($MAX_JOBS_SOURCE)
 
 It will download Python/CUDA dependencies, compile CUDA extensions, and keep
@@ -331,7 +425,7 @@ check_cpu_cores() {
 }
 
 check_memory_headroom() {
-  local mem_kb mem_gb
+  local mem_kb mem_gb recommended_jobs
   mem_kb=$(awk '/MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
   mem_gb=$(( mem_kb / 1024 / 1024 ))
   if (( mem_gb < 16 )); then
@@ -339,6 +433,8 @@ check_memory_headroom() {
   else
     echo "Preflight: system memory is OK (${mem_gb}GB)."
   fi
+  recommended_jobs=$(select_max_jobs "$CPU_THREADS" "$mem_gb")
+  echo "Preflight: auto build threads would use $recommended_jobs job(s) on this host."
 }
 
 check_disk_headroom() {
@@ -584,11 +680,17 @@ active_git_url() {
   fi
 }
 
+git_in_safe_repo() {
+  local dir=$1
+  shift
+  git -c safe.directory="$dir" -C "$dir" "$@"
+}
+
 fetch_git_repo_once() {
   local repo=$1
   if [[ -d "$FLASHQLA_DIR/.git" ]]; then
-    git -C "$FLASHQLA_DIR" fetch --depth=1 "$repo"
-    git -C "$FLASHQLA_DIR" checkout -q FETCH_HEAD
+    git_in_safe_repo "$FLASHQLA_DIR" fetch --depth=1 "$repo"
+    git_in_safe_repo "$FLASHQLA_DIR" checkout -q FETCH_HEAD
   else
     git clone --depth=1 "$repo" "$FLASHQLA_DIR"
   fi
@@ -600,8 +702,8 @@ fetch_git_tag_once() {
   local ref=$3
 
   if [[ -d "$dir/.git" ]]; then
-    git -C "$dir" fetch --depth=1 origin "tag" "$ref"
-    git -C "$dir" checkout -q "$ref"
+    git_in_safe_repo "$dir" fetch --depth=1 origin "tag" "$ref"
+    git_in_safe_repo "$dir" checkout -q "$ref"
   else
     git clone --depth=1 --branch "$ref" --single-branch "$repo" "$dir"
   fi
@@ -613,8 +715,8 @@ fetch_git_branch_or_tag_once() {
   local ref=$3
 
   if [[ -d "$dir/.git" ]]; then
-    git -C "$dir" fetch --depth=1 origin "refs/tags/$ref:refs/tags/$ref"
-    git -C "$dir" checkout -q "$ref"
+    git_in_safe_repo "$dir" fetch --depth=1 origin "refs/tags/$ref:refs/tags/$ref"
+    git_in_safe_repo "$dir" checkout -q "$ref"
   else
     git clone --depth=1 --branch "$ref" --single-branch "$repo" "$dir"
   fi
@@ -649,9 +751,14 @@ fetch_flashqla_with_fallback() {
   if run_with_progress_status "Selected-route git attempt" \
     env FLASHQLA_DIR="$FLASHQLA_DIR" timeout --preserve-status "$timeout_seconds" bash -c '
       repo=$1
+      git_in_safe_repo() {
+        local dir=$1
+        shift
+        git -c safe.directory="$dir" -C "$dir" "$@"
+      }
       if [[ -d "$FLASHQLA_DIR/.git" ]]; then
-        git -C "$FLASHQLA_DIR" fetch --depth=1 "$repo"
-        git -C "$FLASHQLA_DIR" checkout -q FETCH_HEAD
+        git_in_safe_repo "$FLASHQLA_DIR" fetch --depth=1 "$repo"
+        git_in_safe_repo "$FLASHQLA_DIR" checkout -q FETCH_HEAD
       else
         git clone --depth=1 "$repo" "$FLASHQLA_DIR"
       fi
@@ -707,9 +814,14 @@ fetch_cutlass_with_fallback() {
       repo=$1
       ref=$2
       dir=$3
+      git_in_safe_repo() {
+        local repo_dir=$1
+        shift
+        git -c safe.directory="$repo_dir" -C "$repo_dir" "$@"
+      }
       if [[ -d "$dir/.git" ]]; then
-        git -C "$dir" fetch --depth=1 origin tag "$ref"
-        git -C "$dir" checkout -q "$ref"
+        git_in_safe_repo "$dir" fetch --depth=1 origin tag "$ref"
+        git_in_safe_repo "$dir" checkout -q "$ref"
       else
         git clone --depth=1 --branch "$ref" --single-branch "$repo" "$dir"
       fi
@@ -749,6 +861,7 @@ fetch_triton_with_fallback() {
   if [[ -e "$TRITON_KERNELS_DIR" && ! -d "$TRITON_KERNELS_DIR/.git" ]]; then
     fail "TRITON_KERNELS_DIR exists but is not a git checkout: $TRITON_KERNELS_DIR"
   fi
+  refresh_empty_checkout "$TRITON_KERNELS_DIR" "$TRITON_KERNELS_SRC_DIR"
 
   echo "Triton fetch fallback: enabled"
   echo "  Selected-route attempt timeout: ${timeout_seconds}s"
@@ -766,9 +879,14 @@ fetch_triton_with_fallback() {
       repo=$1
       ref=$2
       dir=$3
+      git_in_safe_repo() {
+        local repo_dir=$1
+        shift
+        git -c safe.directory="$repo_dir" -C "$repo_dir" "$@"
+      }
       if [[ -d "$dir/.git" ]]; then
-        git -C "$dir" fetch --depth=1 origin "refs/tags/$ref:refs/tags/$ref"
-        git -C "$dir" checkout -q "$ref"
+        git_in_safe_repo "$dir" fetch --depth=1 origin "refs/tags/$ref:refs/tags/$ref"
+        git_in_safe_repo "$dir" checkout -q "$ref"
       else
         git clone --depth=1 --branch "$ref" --single-branch "$repo" "$dir"
       fi
@@ -795,12 +913,9 @@ fetch_triton_with_fallback() {
 }
 
 install_torch_from_wheelhouse() {
-  local wheelhouse_dir=${BUILD_WHEELHOUSE_DIR:-}
-  if [[ -z "$wheelhouse_dir" && -d /data/wheelhouse/cu128 ]]; then
-    wheelhouse_dir=/data/wheelhouse/cu128
-  fi
+  local wheelhouse_dir
+  wheelhouse_dir=$(resolve_torch_wheelhouse_dir)
   [[ -n "$wheelhouse_dir" ]] || return 0
-  [[ -d "$wheelhouse_dir" ]] || return 0
 
   run_with_progress "Install torch from local wheelhouse" \
     env UV_NO_INDEX=1 UV_FIND_LINKS="$wheelhouse_dir" UV_LINK_MODE=copy \
@@ -808,11 +923,106 @@ install_torch_from_wheelhouse() {
       "torch==${VALIDATED_TORCH_VERSION}"
 }
 
+install_build_frontend_requirements() {
+  run_uv_pip_with_mirror_fallback "Install build frontend requirements" \
+    install --python .venv/bin/python -U \
+    "pip" \
+    "wheel" \
+    "packaging>=24.2" \
+    "setuptools>=77.0.3,<81.0.0" \
+    "setuptools-scm>=8" \
+    "cmake>=3.26.1" \
+    "ninja"
+}
+
+ensure_build_frontend_tools() {
+  .venv/bin/python - <<'PY'
+from __future__ import annotations
+
+import subprocess
+import sys
+from importlib.metadata import version as pkg_version
+from importlib import import_module
+from pathlib import Path
+
+try:
+    from packaging.version import Version
+except Exception as exc:  # pragma: no cover - hard fail in build script
+    raise SystemExit(f"packaging import failed: {exc}") from exc
+
+required_modules = {
+    "setuptools": ("77.0.3", "81.0.0"),
+    "setuptools_scm": ("8.0.0", None),
+}
+
+for module_name, (min_version, max_exclusive) in required_modules.items():
+    module = import_module(module_name)
+    version = getattr(module, "__version__", None) or pkg_version(module_name.replace("_", "-"))
+    parsed = Version(version)
+    if parsed < Version(min_version):
+        raise SystemExit(f"{module_name} version too old: {version} < {min_version}")
+    if max_exclusive is not None and parsed >= Version(max_exclusive):
+        raise SystemExit(
+            f"{module_name} version too new: {version} >= {max_exclusive}"
+        )
+
+cmake_path = Path(sys.prefix) / "bin" / "cmake"
+if not cmake_path.is_file():
+    raise SystemExit(f"missing venv cmake: {cmake_path}")
+
+output = subprocess.check_output([str(cmake_path), "--version"], text=True)
+first_line = output.splitlines()[0].strip()
+version_text = first_line.rsplit(" ", 1)[-1]
+if Version(version_text) < Version("3.26.1"):
+    raise SystemExit(f"cmake version too old: {version_text} < 3.26.1")
+
+print(f"build_frontend_ok setuptools={pkg_version('setuptools')} "
+      f"setuptools_scm={pkg_version('setuptools-scm')} "
+      f"cmake={version_text}")
+PY
+}
+
 run_step() {
   local title=$1
   shift
   print_step_header "$title"
   "$@" 2>&1 | tee -a "$LOG"
+}
+
+resolve_torch_wheelhouse_dir() {
+  local wheelhouse_dir=${BUILD_WHEELHOUSE_DIR:-}
+  if [[ -z "$wheelhouse_dir" && -d /data/wheelhouse/cu128 ]]; then
+    wheelhouse_dir=/data/wheelhouse/cu128
+  fi
+  if [[ -n "$wheelhouse_dir" && -d "$wheelhouse_dir" ]]; then
+    printf '%s\n' "$wheelhouse_dir"
+  fi
+}
+
+compute_total_steps() {
+  local total=0
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    total=$((total + 1))
+  fi
+
+  total=$((total + 1))  # CUDA compiler
+
+  if [[ -d .venv && ! -x .venv/bin/python ]]; then
+    total=$((total + 1))
+  elif [[ ! -d .venv ]]; then
+    total=$((total + 1))
+  fi
+
+  if [[ -n "$(resolve_torch_wheelhouse_dir)" ]]; then
+    total=$((total + 1))
+  fi
+
+  total=$((total + 5))  # build frontend + requirement install/revalidation
+  total=$((total + 6))  # FlashQLA/CUTLASS/Triton fetch+install steps
+  total=$((total + 2))  # runtime install + runtime validation
+
+  printf '%s\n' "$total"
 }
 
 mkdir -p "$LOG_DIR"
@@ -826,15 +1036,31 @@ CPU_THREADS=${CPU_THREADS:-$(detect_cpu_threads)}
 if ! is_positive_integer "$CPU_THREADS"; then
   fail "CPU_THREADS must be a positive integer when set explicitly."
 fi
-if [[ -z "${MAX_JOBS:-}" ]]; then
-  MAX_JOBS=$(select_max_jobs "$CPU_THREADS")
-  MAX_JOBS_SOURCE=auto
-else
-  is_positive_integer "$MAX_JOBS" || fail "MAX_JOBS must be a positive integer."
-  MAX_JOBS_SOURCE=manual
+MEMORY_GB=${MEMORY_GB:-$(detect_memory_gb)}
+if ! is_positive_integer "$MEMORY_GB"; then
+  fail "MEMORY_GB must be a positive integer when set explicitly."
 fi
+if [[ -n "${BUILD_MAX_JOBS:-}" && -n "${MAX_JOBS:-}" && "${BUILD_MAX_JOBS}" != "${MAX_JOBS}" ]]; then
+  fail "BUILD_MAX_JOBS and MAX_JOBS must match when both are set."
+fi
+if [[ -n "${BUILD_MAX_JOBS:-}" ]]; then
+  MAX_JOBS="$BUILD_MAX_JOBS"
+  MAX_JOBS_SOURCE=env:BUILD_MAX_JOBS
+elif [[ -n "${MAX_JOBS:-}" ]]; then
+  MAX_JOBS_SOURCE=env:MAX_JOBS
+else
+  MAX_JOBS=$(select_max_jobs "$CPU_THREADS" "$MEMORY_GB")
+  if (( MAX_JOBS < CPU_THREADS )); then
+    MAX_JOBS_SOURCE=auto-memory
+  else
+    MAX_JOBS_SOURCE=auto
+  fi
+fi
+validate_max_jobs_range "$MAX_JOBS" "$CPU_THREADS"
 export CPU_THREADS
+export MEMORY_GB
 export MAX_JOBS
+export BUILD_MAX_JOBS=${BUILD_MAX_JOBS:-$MAX_JOBS}
 
 cd "$ROOT"
 
@@ -847,6 +1073,7 @@ check_memory_headroom
 check_disk_headroom
 check_gpu_hardware
 check_gpu_topology
+configure_build_parallelism
 
 if [[ -z "${CUDA_HOME:-}" ]]; then
   if [[ -x /usr/local/cuda-12.8/bin/nvcc ]]; then
@@ -862,6 +1089,7 @@ if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
   fail "nvcc not found at $CUDA_HOME/bin/nvcc."
 fi
 validate_cuda_dev_files
+reset_stale_fetchcontent_subbuilds
 choose_download_mode
 confirm_install
 
@@ -882,6 +1110,9 @@ export CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release}
 export FLASHINFER_ENABLE_AOT=${FLASHINFER_ENABLE_AOT:-1}
 export VLLM_CUTLASS_SRC_DIR=${VLLM_CUTLASS_SRC_DIR:-$CUTLASS_DIR}
 export TRITON_KERNELS_SRC_DIR=${TRITON_KERNELS_SRC_DIR:-"$TRITON_KERNELS_DIR/python/triton_kernels/triton_kernels"}
+export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-$MAX_JOBS}
+export NVCC_THREADS=${NVCC_THREADS:-1}
+TOTAL_STEPS=$(compute_total_steps)
 
 cat <<EOF | tee -a "$LOG"
 
@@ -898,7 +1129,11 @@ Build settings:
   TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
   UV_TORCH_BACKEND=$UV_TORCH_BACKEND
   CPU_THREADS=$CPU_THREADS
+  MEMORY_GB=$MEMORY_GB
   MAX_JOBS=$MAX_JOBS ($MAX_JOBS_SOURCE)
+  BUILD_MAX_JOBS=$BUILD_MAX_JOBS
+  CMAKE_BUILD_PARALLEL_LEVEL=$CMAKE_BUILD_PARALLEL_LEVEL
+  NVCC_THREADS=$NVCC_THREADS
   CMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE
   VENV=$ROOT/.venv
   Python package mirror fallback=${BUILD_PYPI_MIRROR_FALLBACK:-1}
@@ -926,7 +1161,10 @@ else
 fi
 run_step "CUDA compiler" "$CUDA_HOME/bin/nvcc" --version
 
-if [[ ! -d .venv ]]; then
+if [[ -d .venv && ! -x .venv/bin/python ]]; then
+  echo "Preflight: existing .venv is invalid or points to a missing Python; recreating it."
+  run_with_progress "Recreate Python virtualenv" uv venv --clear --python "${PYTHON_VERSION:-3.11}" .venv
+elif [[ ! -d .venv ]]; then
   run_with_progress "Create Python virtualenv" uv venv --python "${PYTHON_VERSION:-3.11}" .venv
 fi
 
@@ -936,15 +1174,16 @@ fi
 
 install_torch_from_wheelhouse
 
-run_uv_pip_with_mirror_fallback "Upgrade build frontend" install --python .venv/bin/python -U pip setuptools wheel
+install_build_frontend_requirements
+run_with_progress "Validate build frontend tools" ensure_build_frontend_tools
 
-if [[ -f requirements/build/cuda.txt ]]; then
-  run_uv_pip_with_mirror_fallback "Install CUDA build requirements" install --python .venv/bin/python -r requirements/build/cuda.txt
-fi
+[[ -f requirements/build/cuda.txt ]] || fail "Missing requirements/build/cuda.txt. Re-sync the repository before building."
+run_uv_pip_with_mirror_fallback "Install CUDA build requirements" install --python .venv/bin/python -r requirements/build/cuda.txt
+run_with_progress "Re-validate build frontend tools" ensure_build_frontend_tools
 
-if [[ -f requirements/cuda.txt ]]; then
-  run_uv_pip_with_mirror_fallback "Install CUDA runtime requirements" install --python .venv/bin/python -r requirements/cuda.txt
-fi
+[[ -f requirements/cuda.txt ]] || fail "Missing requirements/cuda.txt. Re-sync the repository before building."
+run_uv_pip_with_mirror_fallback "Install CUDA runtime requirements" install --python .venv/bin/python -r requirements/cuda.txt
+run_with_progress "Re-validate build frontend tools after runtime deps" ensure_build_frontend_tools
 
 patch_flashqla_sm75_imports() {
   python - "$FLASHQLA_DIR" "$ROOT/tools/flashqla_sm75_patches" <<'PY'

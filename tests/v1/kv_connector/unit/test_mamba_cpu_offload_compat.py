@@ -62,3 +62,29 @@ def test_hybrid_mamba_external_hit_is_aligned_and_does_not_crash():
         )
         == 16
     )
+
+
+def test_mamba_align_mtp_can_retain_final_cache_boundary():
+    """An uncached tail supplies MTP state without dropping a full block."""
+    request = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=14,
+        num_tokens=14,
+    )
+    legacy_scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=4),
+        use_eagle=True,
+        retain_mamba_align_mtp_cache_block=False,
+    )
+    fixed_scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=4),
+        use_eagle=True,
+        retain_mamba_align_mtp_cache_block=True,
+    )
+
+    assert (
+        Scheduler._mamba_block_aligned_split(legacy_scheduler, request, 14) == 8
+    )
+    assert (
+        Scheduler._mamba_block_aligned_split(fixed_scheduler, request, 14) == 12
+    )

@@ -5450,6 +5450,21 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
+        # A uniform speculative-decode dummy batch must look like decode to
+        # state-space attention metadata builders during the eager warmup that
+        # precedes CUDA graph capture.  Without these values, GDN/Mamba sees
+        # K+1 scheduled tokens as a short prefill and may compile an unrelated
+        # varlen prefill kernel before capturing the decode graph.
+        if uniform_decode and self.speculative_config and max_query_len > 1:
+            num_draft_tokens = max_query_len - 1
+            self.num_decode_draft_tokens.np[:num_reqs].fill(num_draft_tokens)
+            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+            self.num_decode_draft_tokens.copy_to_gpu()
+
+            self.num_accepted_tokens.np[:num_reqs].fill(max_query_len)
+            self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.num_accepted_tokens.copy_to_gpu()
+
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,

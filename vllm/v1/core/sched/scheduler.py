@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -217,6 +218,23 @@ class Scheduler(SchedulerInterface):
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        # Qwen3.5 MTP uses the EAGLE scheduling path. In Mamba ``align`` mode,
+        # the legacy EAGLE workaround moves the final cache boundary back by a
+        # whole Mamba block so hidden states are recomputed for the drafter.
+        # Those blocks can exceed 2K tokens. When the prompt has an uncached
+        # tail, that tail already produces the required target-model hidden
+        # states, so retaining the final aligned state is safe and avoids an
+        # otherwise unnecessary full-block prefill on every repeated request.
+        self.retain_mamba_align_mtp_cache_block = (
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and self.cache_config.mamba_cache_mode == "align"
+            and os.getenv(
+                "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -285,8 +303,8 @@ class Scheduler(SchedulerInterface):
             # last chunk must be not smaller than `block_size`.
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
+            # Preserve the final aligned state for the opt-in MTP fast path.
+            if self.use_eagle and not self.retain_mamba_align_mtp_cache_block:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:

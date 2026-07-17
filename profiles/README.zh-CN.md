@@ -22,6 +22,14 @@ profiles/
       fp8/
       int4/
     user/
+  qwen35b/
+    normal/
+      fp8/
+    aggressive/
+      fp8/
+    fast/
+      fp8/
+    user/
 ```
 
 启动模式：
@@ -49,10 +57,14 @@ KV 精度定位：
 - `fp16kv`：质量路线。
 - `int8kv`：容量 / 平衡路线；当前只作为 `normal` profile 保留。
 - `tqk8v4`：TurboQuant K8V4 压缩路线；当前只保留质量通过的 `fast` profile。
+- 官方 Qwen3.6 35B 当前提供 FP8 权重 + FP16 KV 的纯文本和图文预设。
+
+内置 TQK8V4 profile 使用 `MAX_BATCHED_TOKENS=2560`，这是 Qwen hybrid cache
+block 对齐后的 prefix-cache 路径已验证设置。
 
 ## 已验证 Profile
 
-### FP8
+### Qwen3.6 27B FP8
 
 测试权重：Jackrong/Qwopus3.6-27B-v2-FP8，约 29G。
 
@@ -64,9 +76,23 @@ KV 精度定位：
 | `qwen27b/fast/fp8/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1615.81 / 81.06 |
 | `qwen27b/fast/fp8/tqk8v4-240K-mtp3-text-image.env` | fast | 240K | TQK8V4 | 3 | text+image | 1 | 1605.61 / 80.67 |
 
-### AWQ/GPTQ-INT4
+### Qwen3.6 35B FP8
 
-测试权重：GPTQ-INT4，约 19G。
+测试目标权重：Qwen/Qwen3.6-35B-A3B-FP8，约 36G。
+
+| Profile | 兼容模式 | 上下文 | KV | MTP | 消息 | 并发 | 吞吐性能 |
+|---|---|---:|---|---:|---|---:|---:|
+| `qwen35b/normal/fp8/fp16kv-256K-nomtp-text-only.env` | normal | 256K | FP16 | 0 | text-only | 1 | 6705.13 / 97.33 |
+| `qwen35b/normal/fp8/fp16kv-136K-nomtp-text-image.env` | normal | 136K | FP16 | 0 | text+image | 1 | 5485.13 / 95.20 |
+| `qwen35b/aggressive/fp8/fp16kv-256K-nomtp-text-only.env` | aggressive | 256K | FP16 | 0 | text-only | 1 | 6843.01 / 124.01 |
+| `qwen35b/aggressive/fp8/fp16kv-136K-nomtp-text-image.env` | aggressive | 136K | FP16 | 0 | text+image | 1 | 5422.83 / 124.11 |
+| `qwen35b/fast/fp8/fp16kv-178K-mtp3-text-only.env` | fast | 178K | FP16 | 3 | text-only | 1 | 5889.20 / 195.95 |
+
+### Qwen3.6 27B AWQ/GPTQ-INT4
+
+测试权重：QuantTrio/Qwen3.6-27B-AWQ、mconcat/Qwopus3.6-27B-v2-AWQ-4bit，以及
+llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4，
+约 19G。
 
 | Profile | 兼容模式 | 上下文 | KV | MTP | 消息 | 并发 | 吞吐性能 |
 |---|---|---:|---|---:|---|---:|---:|
@@ -77,7 +103,3 @@ KV 精度定位：
 | `qwen27b/fast/int4/fp16kv-256K-mtp3-text-only.env` | fast | 256K | FP16 | 3 | text-only | 1 | 1734.98 / 87.00 |
 | `qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1744.67 / 100.81 |
 | `qwen27b/fast/int4/tqk8v4-two250K-mtp3-text-only.env` | fast | 每工作区 250K | TQK8V4 | 3 | text-only | 2 | 1739.23 / 99.91 |
-
-表中的吞吐性能是在 `4096/128` 口径下测试，格式为
-`prefill tok/s / decode tok/s`。测试前会先跑中文质量 smoke；质量失败的路线不作为
-profile 保留。

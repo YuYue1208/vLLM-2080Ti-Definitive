@@ -390,7 +390,16 @@ class ChunkGatedDeltaRule(CustomOp):
 
         logger.warning_once(
             "FlashQLA legacy GDN prefill received unsupported varlen/chunked "
-            "metadata; falling back to Triton/FLA for this call."
+            "metadata; falling back to Triton/FLA for this call. "
+            "q_shape=%s k_shape=%s v_shape=%s cu_seqlens=%s "
+            "chunk_indices=%s chunk_offsets=%s capturing=%s",
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            None if cu_seqlens is None else tuple(cu_seqlens.shape),
+            None if chunk_indices is None else tuple(chunk_indices.shape),
+            None if chunk_offsets is None else tuple(chunk_offsets.shape),
+            torch.cuda.is_current_stream_capturing(),
         )
         return self.forward_native(
             q=q,

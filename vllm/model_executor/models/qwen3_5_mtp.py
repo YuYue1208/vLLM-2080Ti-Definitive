@@ -410,6 +410,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=vllm_config.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

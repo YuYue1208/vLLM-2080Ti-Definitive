@@ -3,6 +3,63 @@
 This changelog tracks the fork release version for vLLM 2080 Ti Definitive
 Edition. It is separate from the upstream vLLM package version.
 
+## v0.1.14 - 2026-07-07
+
+- Merges [PR #78](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/78)
+  from @0xYYP, improving the validated SM75 TurboQuant long-context route with
+  the tested continuation prefix-combine path, tuned decode `BLOCK_KV=2`
+  defaults, reproducible long-context benchmark controls, and launcher/runtime
+  plumbing for the shipped TurboQuant throughput lane.
+- Merges [PR #81](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/81)
+  from @weicj, finalizing the non-interactive launcher override path with
+  explicit `CLI > ENV > PROFILE > default` precedence, `CUDA_VISIBLE_DEVICES`
+  mapping, mode-derived override hygiene, and matching English / Simplified
+  Chinese launcher documentation.
+- Release credit: @0xYYP and @weicj.
+
+## v0.1.13 - 2026-07-04
+
+- Merges [PR #71](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/71)
+  from @0xYYP, fixing the SM75 TurboQuant TQK8V4 FP8 key-format path and the
+  launcher submenu numeric-selection regression.
+- Merges [PR #72](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/72)
+  from @hotwa, adding the first validated Docker runtime packaging path for
+  the SM75 fork, including the runtime Dockerfile, compose example, entrypoint
+  flow, and packaged helper assets needed to launch the shipped profiles
+  inside a container.
+- Extends the merged Docker path with the validated host-side `docker/build.sh`
+  wrapper so Docker builds follow the repository `build.sh` behavior for
+  automatic `MAX_JOBS` selection, download-route preflight, and consistent
+  PyPI/Git mirror propagation through Docker and compose builds.
+- Release credit: @0xYYP and @hotwa.
+
+## v0.1.12 - 2026-07-02
+
+- Integrates the SM75 custom all-reduce graph-input auto policy so the official
+  Qwen3.6 35B FP8 release route can keep the validated fast decode path while
+  avoiding the PIECEWISE graph-capture startup crash.
+- Finalizes the current build/install reliability fixes, including safer build
+  parallelism defaults, broken virtualenv self-heal, dependency checkout reuse,
+  and rebuild recovery for fresh source installs.
+- Adds the validated official Qwen3.6 35B FP8 profile set: 256K text-only
+  `normal` and `aggressive`, 136K text+image `normal` and `aggressive`, and a
+  178K `fast` MTP3 route.
+- Fixes the shipped Qwen3.6 27B `fast` TQK8V4 256K prefix-cache continuation
+  route by promoting the validated `GPU_UTIL=0.96` profile values and making
+  the launcher auto-reserve the larger continuation workspace for long
+  single-sequence TurboQuant lanes.
+
+## v0.1.11 - 2026-06-29
+
+- Updates the launcher defaults for long-context serving: prefix cache is now a
+  launcher-level default, prompt token details are enabled for status
+  visibility, and Qwen routes automatically use the cache mode required by the
+  validated prefix-cache path.
+- Adds launcher-side startup safeguards for large profiles, including
+  cold-compile prewarm retry and display-GPU occupancy warnings.
+- Retunes the shipped Qwen3.6 TQK8V4 `fast` profiles for the validated prefix
+  cache path by raising their max batched tokens to `2560`.
+
 ## v0.1.10 - 2026-06-17
 
 - Fixes the Qwen reasoning startup path by keeping `reasoning_content`

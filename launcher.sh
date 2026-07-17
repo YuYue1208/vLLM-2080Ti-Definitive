@@ -18,6 +18,7 @@ LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
 STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
 STAMP=$(date +%Y%m%d-%H%M%S)
 VERSION=${VERSION:-$FORK_RELEASE}
+MENU_DIGIT_TIMEOUT=${LAUNCHER_MENU_DIGIT_TIMEOUT:-0.8}
 
 banner() {
   cat <<EOF
@@ -84,6 +85,38 @@ pid_arg_value() {
     fi
   done <"/proc/$pid/cmdline"
   return 1
+}
+
+pid_has_arg() {
+  local pid=$1
+  local flag=$2
+  local part
+
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  while IFS= read -r -d '' part; do
+    [[ "$part" == "$flag" ]] && return 0
+  done <"/proc/$pid/cmdline"
+  return 1
+}
+
+pid_prefix_cache_label() {
+  local pid=$1
+  if pid_has_arg "$pid" --no-enable-prefix-caching; then
+    printf 'disabled\n'
+  elif pid_has_arg "$pid" --enable-prefix-caching; then
+    printf 'enabled\n'
+  else
+    printf 'auto\n'
+  fi
+}
+
+pid_prompt_details_label() {
+  local pid=$1
+  if pid_has_arg "$pid" --enable-prompt-tokens-details; then
+    printf 'enabled\n'
+  else
+    printf 'disabled\n'
+  fi
 }
 
 service_api_root() {
@@ -203,6 +236,8 @@ render_service_status() {
     printf '  Model:   %s\n' "${SERVED_NAME:-$name}"
     printf '  API:     %s\n' "$api"
     printf '  PID:     %s\n' "$pid"
+    printf '  Prefix:  %s\n' "$(pid_prefix_cache_label "$pid")"
+    printf '  Prompt details: %s\n' "$(pid_prompt_details_label "$pid")"
     render_kv_cache_status "$pid_file" "$pid" "$name" 8
   else
     printf '  Status:  STOPPED\n'
@@ -246,12 +281,310 @@ read_profile_value() {
   ' "$file"
 }
 
+ROUTE_PROFILE_KEYS=(
+  SERVED_NAME
+  COMPATIBLE_MODES
+  MODEL_FAMILY
+  PROFILE_GROUP
+  MODEL_VARIANT
+  QUANTIZATION
+  KV_CACHE_DTYPE
+  MAX_MODEL_LEN
+  KV_CACHE_MEMORY_BYTES
+  GPU_UTIL
+  MAX_BATCHED_TOKENS
+  MAX_NUM_SEQS
+  MTP_K
+  MESSAGE_TYPE
+  MM_LIMIT_JSON
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
+  HF_OVERRIDES_JSON
+  ADDITIONAL_CONFIG_JSON
+  SPECULATIVE_CONFIG
+  COMPILATION_CONFIG_JSON
+  ATTENTION_BACKEND
+  DISABLE_HYBRID_KV_CACHE_MANAGER
+  DISABLE_CUSTOM_ALL_REDUCE
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN
+  VLLM_INT8KV_FA_CASCADE_DEQUANT
+  VLLM_INT8KV_FA_CASCADE_TILE_TOKENS
+  VLLM_INT8KV_FA_CONTINUATION_DEQUANT
+  VLLM_INT8KV_FA_PREFILL
+  VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE
+  VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS
+  VLLM_TURBOQUANT_MAX_KV_SPLITS
+  VLLM_TURBOQUANT_DECODE_BLOCK_KV
+)
+
+NON_INTERACTIVE_CONFIG_KEYS=(
+  MODEL_DIR
+  PROFILE_DIR
+  PROFILE
+  PROFILE_FILE
+  MODE
+  PORT
+  SERVICE_SCOPE
+  GPU_DEVICES
+  TP_SIZE
+  CHAT_TEMPLATE_FILE
+  CHAT_TEMPLATE_PRESET
+  TEMPLATE_DIR
+  REASONING_PARSER
+  DEFAULT_CHAT_TEMPLATE_KWARGS
+  REASONING_MODE
+  REASONING_BUDGET
+  ENABLE_AUTO_TOOL_CHOICE
+  TOOL_CALL_PARSER
+  TOOL_PARSER_PLUGIN
+  ENABLE_PREFIX_CACHING
+  ENABLE_PROMPT_TOKENS_DETAILS
+  DISABLE_PREFIX_CACHING
+  VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH
+  VLLM_ENFORCE_STRICT_TOOL_CALLING
+  MAMBA_CACHE_MODE
+  ENFORCE_EAGER
+  NO_ASYNC_SCHEDULING
+  DISABLE_LOG_STATS
+  VLLM_SM75_SPEC_SYNC_MODE
+  RUNTIME_ROOT
+  LOG_DIR
+  STATE_FILE
+  FLASHQLA_ROOT
+  START_TIMEOUT
+)
+
+NON_INTERACTIVE_BOOLEAN_KEYS=(
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
+  ENABLE_AUTO_TOOL_CHOICE
+  ENABLE_PREFIX_CACHING
+  ENABLE_PROMPT_TOKENS_DETAILS
+  DISABLE_PREFIX_CACHING
+  VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH
+  VLLM_ENFORCE_STRICT_TOOL_CALLING
+  ENFORCE_EAGER
+  NO_ASYNC_SCHEDULING
+  DISABLE_HYBRID_KV_CACHE_MANAGER
+  DISABLE_CUSTOM_ALL_REDUCE
+  DISABLE_LOG_STATS
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN
+  VLLM_INT8KV_FA_CASCADE_DEQUANT
+  VLLM_INT8KV_FA_CONTINUATION_DEQUANT
+  VLLM_INT8KV_FA_PREFILL
+)
+
+declare -A CONFIG_FLAG_TO_KEY=()
+declare -A CONFIG_KNOWN_KEYS=()
+declare -A CONFIG_BOOLEAN_KEYS=()
+declare -A CONFIG_OVERRIDE_SOURCE=()
+declare -A CONFIG_OVERRIDE_UNSET=()
+CONFIG_REGISTRY_INITIALIZED=0
+
+config_key_to_flag() {
+  local key=${1,,}
+  key=${key//_/-}
+  printf -- '--%s\n' "$key"
+}
+
+normalize_config_key() {
+  local raw=${1#--}
+  local key=${raw//-/_}
+  key=${key^^}
+  [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Invalid config key: $1"
+  printf '%s\n' "$key"
+}
+
+init_config_registry() {
+  [[ "$CONFIG_REGISTRY_INITIALIZED" == "1" ]] && return 0
+
+  local key
+  for key in "${ROUTE_PROFILE_KEYS[@]}" "${NON_INTERACTIVE_CONFIG_KEYS[@]}"; do
+    [[ -n "$key" ]] || continue
+    CONFIG_KNOWN_KEYS["$key"]=1
+    CONFIG_FLAG_TO_KEY["$(config_key_to_flag "$key")"]="$key"
+  done
+  for key in "${NON_INTERACTIVE_BOOLEAN_KEYS[@]}"; do
+    [[ -n "$key" ]] || continue
+    CONFIG_BOOLEAN_KEYS["$key"]=1
+  done
+  CONFIG_REGISTRY_INITIALIZED=1
+}
+
+config_key_has_override() {
+  local key=$1
+  [[ -n "${CONFIG_OVERRIDE_SOURCE[$key]+x}" ]]
+}
+
+config_key_has_explicit_value() {
+  local key=$1
+  [[ -n "${CONFIG_OVERRIDE_SOURCE[$key]+x}" \
+    && "${CONFIG_OVERRIDE_SOURCE[$key]}" != mode \
+    && -z "${CONFIG_OVERRIDE_UNSET[$key]+x}" ]]
+}
+
+config_key_is_boolean() {
+  local key=$1
+  [[ -n "${CONFIG_BOOLEAN_KEYS[$key]+x}" ]]
+}
+
+env_var_is_exported() {
+  printenv "$1" >/dev/null 2>&1
+}
+
+set_config_override() {
+  local key=$1
+  local value=$2
+  local source=${3:-cli}
+
+  printf -v "$key" '%s' "$value"
+  export "$key"
+  CONFIG_OVERRIDE_SOURCE["$key"]="$source"
+  unset "CONFIG_OVERRIDE_UNSET[$key]"
+}
+
+unset_config_override() {
+  local key=$1
+  local source=${2:-cli}
+
+  unset "$key"
+  CONFIG_OVERRIDE_SOURCE["$key"]="$source"
+  CONFIG_OVERRIDE_UNSET["$key"]=1
+}
+
+config_key_from_flag() {
+  local flag=$1
+  local key=${CONFIG_FLAG_TO_KEY[$flag]:-}
+  [[ -n "$key" ]] || return 1
+  printf '%s\n' "$key"
+}
+
+parse_set_assignment() {
+  local assignment=$1
+  local source=${2:-cli}
+  local key value
+
+  [[ "$assignment" == *=* ]] || die "--set expects KEY=VALUE."
+  key=$(normalize_config_key "${assignment%%=*}")
+  value=${assignment#*=}
+  set_config_override "$key" "$value" "$source"
+}
+
+register_env_config_overrides() {
+  init_config_registry
+
+  if ! config_key_has_override GPU_DEVICES && env_var_is_exported CUDA_VISIBLE_DEVICES; then
+    set_config_override GPU_DEVICES "${CUDA_VISIBLE_DEVICES:-}" env
+    if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+      CONFIG_OVERRIDE_UNSET["GPU_DEVICES"]=1
+    fi
+  fi
+
+  local key
+  for key in "${!CONFIG_KNOWN_KEYS[@]}"; do
+    env_var_is_exported "$key" || continue
+    config_key_has_override "$key" && continue
+    CONFIG_OVERRIDE_SOURCE["$key"]=env
+    if [[ -z "${!key:-}" ]]; then
+      CONFIG_OVERRIDE_UNSET["$key"]=1
+    fi
+  done
+}
+
+apply_launcher_path_defaults() {
+  RUNTIME_ROOT=${RUNTIME_ROOT:-"$MANAGER_ROOT"}
+  PROFILE_DIR=${PROFILE_DIR:-"$MANAGER_ROOT/profiles"}
+  LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
+
+  if config_key_has_override PROFILE_DIR && ! config_key_has_explicit_value TEMPLATE_DIR; then
+    TEMPLATE_DIR="$PROFILE_DIR/templates"
+  fi
+  TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
+
+  if config_key_has_override LOG_DIR && ! config_key_has_explicit_value STATE_FILE; then
+    STATE_FILE="$LOG_DIR/start-manager.state"
+  fi
+  STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
+}
+
+parse_launcher_args() {
+  init_config_registry
+
+  local arg key value
+  while (($#)); do
+    arg=$1
+    shift
+    case "$arg" in
+      --non-interactive)
+        NON_INTERACTIVE=1
+        ;;
+      --print-config)
+        PRINT_CONFIG=1
+        NON_INTERACTIVE=1
+        ;;
+      --set)
+        (($#)) || die "--set expects KEY=VALUE."
+        parse_set_assignment "$1" cli
+        shift
+        NON_INTERACTIVE=1
+        ;;
+      --set=*)
+        parse_set_assignment "${arg#--set=}" cli
+        NON_INTERACTIVE=1
+        ;;
+      --unset)
+        (($#)) || die "--unset expects KEY."
+        key=$(normalize_config_key "$1")
+        unset_config_override "$key" cli
+        shift
+        NON_INTERACTIVE=1
+        ;;
+      --unset=*)
+        key=$(normalize_config_key "${arg#--unset=}")
+        unset_config_override "$key" cli
+        NON_INTERACTIVE=1
+        ;;
+      --*=*)
+        key=$(config_key_from_flag "${arg%%=*}") || die "Unknown option: ${arg%%=*}"
+        value=${arg#*=}
+        set_config_override "$key" "$value" cli
+        NON_INTERACTIVE=1
+        ;;
+      --*)
+        key=$(config_key_from_flag "$arg") || die "Unknown option: $arg"
+        if config_key_is_boolean "$key" && { (($# == 0)) || [[ "${1:-}" == --* ]]; }; then
+          value=1
+        else
+          (($#)) || die "Option $arg expects a value."
+          value=$1
+          shift
+        fi
+        set_config_override "$key" "$value" cli
+        NON_INTERACTIVE=1
+        ;;
+      *)
+        die "Unknown positional argument: $arg"
+        ;;
+    esac
+  done
+}
+
+reset_route_profile_fields() {
+  local key
+  for key in "${ROUTE_PROFILE_KEYS[@]}"; do
+    config_key_has_override "$key" && continue
+    unset "$key"
+  done
+}
+
 profile_key_is_global() {
   case "$1" in
 MODEL_DIR|PROFILE_DIR|PROFILE|MODE|PORT|SERVICE_SCOPE|GPU_DEVICES|TP_SIZE|\
 CHAT_TEMPLATE_FILE|CHAT_TEMPLATE_PRESET|TEMPLATE_DIR|REASONING_PARSER|\
 DEFAULT_CHAT_TEMPLATE_KWARGS|REASONING_MODE|REASONING_BUDGET|\
 ENABLE_AUTO_TOOL_CHOICE|TOOL_CALL_PARSER|TOOL_PARSER_PLUGIN|\
+ENABLE_PREFIX_CACHING|ENABLE_PROMPT_TOKENS_DETAILS|\
+DISABLE_PREFIX_CACHING|\
 VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH|VLLM_ENFORCE_STRICT_TOOL_CALLING)
       return 0
       ;;
@@ -269,7 +602,7 @@ source_profile_defaults() {
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     profile_key_is_global "$key" && continue
-    if [[ -v "$key" ]]; then
+    if config_key_has_override "$key" || [[ ${!key+x} ]]; then
       continue
     fi
     value=$(read_profile_value "$file" "$key")
@@ -283,9 +616,33 @@ apply_profile_overrides() {
   [[ -f "$file" ]] || return 0
 
   local key value
+  local preserve_route_env_keys=(
+    KV_CACHE_MEMORY_BYTES
+    VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE
+    VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS
+    VLLM_TURBOQUANT_MAX_KV_SPLITS
+    VLLM_TURBOQUANT_DECODE_BLOCK_KV
+  )
+  local preserved_keys=()
+  local preserved_values=()
+  local preserve_key
+  for preserve_key in "${preserve_route_env_keys[@]}"; do
+    if [[ -z "$(read_profile_value "$file" "$preserve_key")" && ${!preserve_key+x} ]]; then
+      preserved_keys+=("$preserve_key")
+      preserved_values+=("${!preserve_key}")
+    fi
+  done
+
+  reset_route_profile_fields
+  local preserve_index
+  for preserve_index in "${!preserved_keys[@]}"; do
+    printf -v "${preserved_keys[$preserve_index]}" '%s' "${preserved_values[$preserve_index]}"
+    export "${preserved_keys[$preserve_index]}"
+  done
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     profile_key_is_global "$key" && continue
+    config_key_has_override "$key" && continue
     value=$(read_profile_value "$file" "$key")
     printf -v "$key" '%s' "$value"
     export "$key"
@@ -332,11 +689,18 @@ save_manager_state() {
     printf 'QUANTIZATION=%q\n' "${QUANTIZATION:-}"
     printf 'KV_CACHE_DTYPE=%q\n' "${KV_CACHE_DTYPE:-}"
     printf 'MAMBA_CACHE_MODE=%q\n' "${MAMBA_CACHE_MODE:-}"
+    printf 'ENABLE_PREFIX_CACHING=%q\n' "${ENABLE_PREFIX_CACHING:-1}"
+    printf 'ENABLE_PROMPT_TOKENS_DETAILS=%q\n' "${ENABLE_PROMPT_TOKENS_DETAILS:-1}"
     printf 'MAX_MODEL_LEN=%q\n' "${MAX_MODEL_LEN:-}"
+    printf 'KV_CACHE_MEMORY_BYTES=%q\n' "${KV_CACHE_MEMORY_BYTES:-}"
     printf 'GPU_UTIL=%q\n' "${GPU_UTIL:-}"
     printf 'MAX_BATCHED_TOKENS=%q\n' "${MAX_BATCHED_TOKENS:-}"
     printf 'MAX_NUM_SEQS=%q\n' "${MAX_NUM_SEQS:-}"
     printf 'MTP_K=%q\n' "${MTP_K:-}"
+    printf 'VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE=%q\n' "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE:-}"
+    printf 'VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS=%q\n' "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS:-}"
+    printf 'VLLM_TURBOQUANT_MAX_KV_SPLITS=%q\n' "${VLLM_TURBOQUANT_MAX_KV_SPLITS:-}"
+    printf 'VLLM_TURBOQUANT_DECODE_BLOCK_KV=%q\n' "${VLLM_TURBOQUANT_DECODE_BLOCK_KV:-}"
     printf 'MESSAGE_TYPE=%q\n' "${MESSAGE_TYPE:-}"
     printf 'MM_LIMIT_JSON=%q\n' "${MM_LIMIT_JSON:-}"
     printf 'LANGUAGE_MODEL_ONLY=%q\n' "${LANGUAGE_MODEL_ONLY:-}"
@@ -428,17 +792,16 @@ mode_is_compatible() {
   local compatible_modes=${2:-safe,normal,fast}
   local candidate
 
-  # aggressive intentionally has no shipped profile directory. It can run
-  # fast-compatible routes only when the user explicitly selects the mode.
-  if [[ "$mode" == "aggressive" ]]; then
-    mode=fast
-  fi
   for candidate in ${compatible_modes//,/ }; do
     candidate=${candidate//[[:space:]]/}
     case "$candidate" in
       stable) candidate=safe ;;
       speed) candidate=normal ;;
     esac
+    if [[ "$mode" == "aggressive" ]]; then
+      [[ "$candidate" == "aggressive" || "$candidate" == "fast" ]] && return 0
+      continue
+    fi
     [[ "$candidate" == "$mode" ]] && return 0
   done
   return 1
@@ -465,7 +828,7 @@ profile_compatible_modes_for_current() {
   local mtp=${MTP_K:-0}
 
   if [[ "$mode" == "aggressive" ]]; then
-    echo fast
+    echo aggressive
     return 0
   fi
 
@@ -598,11 +961,71 @@ apply_family_reasoning_defaults() {
   # Qwen3/Qwen3.5 tokenizer configs do not always advertise the parser.
   # Keep request thinking defaults template-driven, but make response parsing
   # explicit so thinking text is not returned as normal content.
+  if config_key_has_explicit_value REASONING_PARSER; then
+    return 0
+  fi
   if reasoning_parser_is_disabled; then
     return 0
   fi
   if default_qwen_reasoning_parser_applies; then
     REASONING_PARSER=${REASONING_PARSER:-qwen3}
+  elif [[ "${REASONING_PARSER:-}" == "qwen3" ]]; then
+    REASONING_PARSER=""
+  fi
+}
+
+apply_prefix_cache_defaults() {
+  ENABLE_PREFIX_CACHING=$(normalize_bool "${ENABLE_PREFIX_CACHING:-1}")
+  ENABLE_PROMPT_TOKENS_DETAILS=$(normalize_bool "${ENABLE_PROMPT_TOKENS_DETAILS:-1}")
+  DISABLE_PREFIX_CACHING=$(normalize_bool "${DISABLE_PREFIX_CACHING:-0}")
+
+  if [[ "$DISABLE_PREFIX_CACHING" == "1" ]]; then
+    ENABLE_PREFIX_CACHING=0
+    return 0
+  fi
+
+  if config_key_has_explicit_value MAMBA_CACHE_MODE; then
+    return 0
+  fi
+
+  if [[ "$ENABLE_PREFIX_CACHING" == "1" && "$MODEL_FAMILY" == qwen* ]]; then
+    MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE:-align}
+  elif [[ "${MAMBA_CACHE_MODE:-}" == "align" ]]; then
+    # align is only injected as the Qwen prefix-cache default. Clear it when
+    # the current route no longer uses that default to avoid stale state bleed.
+    MAMBA_CACHE_MODE=""
+  fi
+}
+
+normalize_message_type_defaults() {
+  if config_key_has_explicit_value MESSAGE_TYPE; then
+    MESSAGE_TYPE=${MESSAGE_TYPE:-text-only}
+  elif [[ "${MESSAGE_TYPE:-}" == "text+image" || -n "${MM_LIMIT_JSON:-}" || "${LANGUAGE_MODEL_ONLY:-1}" == "0" ]]; then
+    MESSAGE_TYPE=text+image
+  else
+    MESSAGE_TYPE=text-only
+  fi
+
+  if [[ "$MESSAGE_TYPE" == "text+image" ]]; then
+    if ! config_key_has_explicit_value MM_LIMIT_JSON; then
+      MM_LIMIT_JSON=${MM_LIMIT_JSON:-'{"image":1,"video":0,"audio":0}'}
+    fi
+    if ! config_key_has_explicit_value LANGUAGE_MODEL_ONLY; then
+      LANGUAGE_MODEL_ONLY=0
+    fi
+    if ! config_key_has_explicit_value SKIP_MM_PROFILING; then
+      SKIP_MM_PROFILING=$(normalize_bool "${SKIP_MM_PROFILING:-0}")
+    fi
+  else
+    if ! config_key_has_explicit_value MM_LIMIT_JSON; then
+      MM_LIMIT_JSON=""
+    fi
+    if ! config_key_has_explicit_value LANGUAGE_MODEL_ONLY; then
+      LANGUAGE_MODEL_ONLY=1
+    fi
+    if ! config_key_has_explicit_value SKIP_MM_PROFILING; then
+      SKIP_MM_PROFILING=1
+    fi
   fi
 }
 
@@ -629,6 +1052,31 @@ current_tool_calling_label() {
   fi
 
   printf '%s\n' "$label"
+}
+
+current_prefix_cache_label() {
+  if [[ "${DISABLE_PREFIX_CACHING:-0}" == "1" ]]; then
+    printf 'disabled'
+  elif [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+    printf 'enabled'
+  else
+    printf 'auto'
+  fi
+}
+
+current_tq_diagnostics_label() {
+  if [[ "${KV_CACHE_DTYPE:-}" != turboquant_* ]]; then
+    printf 'n/a'
+    return 0
+  fi
+  printf 'FORCE_DECODE_SDPA=%s, FORCE_CONTINUATION_SDPA=%s, PREFIX_COMBINE=%s@%s, MAX_KV_SPLITS=%s, DECODE_BLOCK_KV=%s, K8V4_FP8_FORMAT=%s' \
+    "${VLLM_TURBOQUANT_FORCE_DECODE_SDPA:-0}" \
+    "${VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA:-0}" \
+    "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE:-auto}" \
+    "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS:-20480}" \
+    "${VLLM_TURBOQUANT_MAX_KV_SPLITS:-auto}" \
+    "${VLLM_TURBOQUANT_DECODE_BLOCK_KV:-4}" \
+    "${VLLM_TURBOQUANT_K8V4_FP8_FORMAT:-auto}"
 }
 
 gpu_device_count() {
@@ -662,6 +1110,40 @@ list_nvidia_gpus() {
     '
 }
 
+warn_display_gpu_occupancy() {
+  local devices=${GPU_DEVICES:-}
+  local device pids pid comm args found=0
+
+  command -v fuser >/dev/null 2>&1 || return 0
+  devices=${devices// /}
+  [[ -n "$devices" ]] || return 0
+
+  IFS=',' read -r -a parts <<< "$devices"
+  for device in "${parts[@]}"; do
+    [[ "$device" =~ ^[0-9]+$ && -e "/dev/nvidia${device}" ]] || continue
+    pids=$(fuser "/dev/nvidia${device}" 2>/dev/null || true)
+    [[ -n "$pids" ]] || continue
+    for pid in $pids; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+      args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+      case "$comm $args" in
+        *Xorg*|*Xwayland*|*gnome-shell*|*kwin*|*plasmashell*|*Hyprland*|*sway*|*gdm*|*sddm*|*lightdm*)
+          if (( found == 0 )); then
+            echo
+            echo "Display GPU warning"
+            echo "  A desktop/display process is using one of the selected compute GPUs."
+            echo "  This reduces available VRAM and can lower the maximum stable context."
+            echo "  Prefer an iGPU or a non-compute display GPU for large-context profiles."
+            found=1
+          fi
+          printf '  GPU %s: pid=%s %s\n' "$device" "$pid" "${comm:-unknown}"
+          ;;
+      esac
+    done
+  done
+}
+
 profile_summary() {
   local profile_file=$1
   [[ -f "$profile_file" ]] || return 0
@@ -675,6 +1157,7 @@ profile_summary() {
     QUANTIZATION
     KV_CACHE_DTYPE
     MAX_MODEL_LEN
+    KV_CACHE_MEMORY_BYTES
     GPU_UTIL
     MAX_BATCHED_TOKENS
     MAX_NUM_SEQS
@@ -700,7 +1183,7 @@ menu_select() {
   local options=("$@")
   local count=${#options[@]}
   local idx=0
-  local key answer answer_rest selected_index number_buffer=""
+  local key next_key answer answer_rest selected_index number_buffer=""
 
   (( count > 0 )) || return 1
   for i in "${!options[@]}"; do
@@ -730,7 +1213,7 @@ menu_select() {
       done
       echo
       if (( count >= 10 )); then
-        echo "Use Up/Down, Enter to select. Type a number then Enter for 10+ items. Esc returns."
+        echo "Use Up/Down, Enter to select. Number keys select directly. Esc returns."
         [[ -n "$number_buffer" ]] && echo "Input: $number_buffer"
       else
         echo "Press a number to select, Enter for the highlighted item."
@@ -772,7 +1255,26 @@ menu_select() {
 
       if [[ "$key" =~ ^[0-9]$ ]]; then
         number_buffer+="$key"
-        if (( number_buffer > count )); then
+        if [[ "$number_buffer" =~ ^[0-9]+$ ]] \
+          && (( 10#$number_buffer >= 1 && 10#$number_buffer <= count )); then
+          if menu_index_prefix_exists "$number_buffer" "$count"; then
+            next_key=""
+            read -rsn1 -t "$MENU_DIGIT_TIMEOUT" next_key </dev/tty || true
+            if [[ "$next_key" =~ ^[0-9]$ ]]; then
+              number_buffer+="$next_key"
+            elif [[ -z "$next_key" ]]; then
+              printf '%s\n' "${options[$((10#$number_buffer - 1))]}"
+              return 0
+            fi
+          fi
+          if [[ "$number_buffer" =~ ^[0-9]+$ ]] \
+            && (( 10#$number_buffer >= 1 && 10#$number_buffer <= count )) \
+            && ! menu_index_prefix_exists "$number_buffer" "$count"; then
+            printf '%s\n' "${options[$((10#$number_buffer - 1))]}"
+            return 0
+          fi
+        fi
+        if ! menu_index_prefix_exists "$number_buffer" "$count"; then
           echo "Please enter a listed number." >&2
           number_buffer=""
           sleep 1
@@ -826,7 +1328,7 @@ menu_select() {
     if [[ "$key" =~ ^[0-9]$ ]]; then
       selected_index="$key"
       if (( count >= 10 && key == 1 )); then
-        read -rsn1 -t 0.25 answer </dev/tty || true
+        read -rsn1 -t "$MENU_DIGIT_TIMEOUT" answer </dev/tty || true
         if [[ "$answer" =~ ^[0-9]$ ]]; then
           selected_index="${key}${answer}"
         fi
@@ -852,6 +1354,19 @@ menu_select() {
     echo "Please press a listed number." >&2
     sleep 1
   done
+}
+
+menu_index_prefix_exists() {
+  local prefix=$1
+  local max=$2
+  local i
+
+  [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+  for ((i = 1; i <= max; i++)); do
+    [[ "$i" == "$prefix" ]] && continue
+    [[ "$i" == "$prefix"* ]] && return 0
+  done
+  return 1
 }
 
 read_menu_key() {
@@ -1146,6 +1661,9 @@ Notes:
     enables strict tool-output constraints for automatic tool choice.
   - thinking_token_budget is a per-request chat parameter in this vLLM runtime.
   - text+image requires a checkpoint that actually supports vision inputs.
+  - Use --set KEY=VALUE for advanced envs such as VLLM_* or compiler paths.
+  - Use --unset KEY to clear inherited profile/env values and fall back to
+    launcher defaults; use --set KEY= to force an empty value when allowed.
   - --print-config prints the final launch summary and exits without starting.
 EOF
   echo
@@ -1159,7 +1677,7 @@ show_profiles() {
   banner
   echo "Profile presets:"
   echo
-  local profile profile_file family variant mode kv context mtp seqs
+  local profile profile_file family variant mode kv context kv_memory mtp seqs
   if [[ ! -d "$PROFILE_DIR" ]]; then
     echo "No profile directory found: $PROFILE_DIR"
     echo
@@ -1175,10 +1693,11 @@ show_profiles() {
     [[ -n "$mode" ]] || mode=$(read_profile_value "$profile_file" MODE)
     kv=$(read_profile_value "$profile_file" KV_CACHE_DTYPE)
     context=$(read_profile_value "$profile_file" MAX_MODEL_LEN)
+    kv_memory=$(read_profile_value "$profile_file" KV_CACHE_MEMORY_BYTES)
     mtp=$(read_profile_value "$profile_file" MTP_K)
     seqs=$(read_profile_value "$profile_file" MAX_NUM_SEQS)
-    printf '  %-62s compatible=%-12s family=%-7s weight=%-6s kv=%-24s ctx=%-8s mtp=%-3s seqs=%s\n' \
-      "$profile" "${mode:-safe,normal,fast}" "${family:-auto}" "${variant:-auto}" "${kv:-fp16}" "${context:-auto}" "${mtp:-0}" "${seqs:-1}"
+    printf '  %-62s compatible=%-12s family=%-7s weight=%-6s kv=%-24s ctx=%-8s kvmem=%-10s mtp=%-3s seqs=%s\n' \
+      "$profile" "${mode:-safe,normal,fast}" "${family:-auto}" "${variant:-auto}" "${kv:-fp16}" "${context:-auto}" "${kv_memory:-auto}" "${mtp:-0}" "${seqs:-1}"
   done < <(list_profiles)
   echo
   pause_enter
@@ -1406,10 +1925,15 @@ save_current_profile_menu() {
   write_profile_entry "$target_file.tmp" QUANTIZATION "${QUANTIZATION:-}"
   write_profile_entry "$target_file.tmp" KV_CACHE_DTYPE "${KV_CACHE_DTYPE:-}"
   write_profile_entry "$target_file.tmp" MAX_MODEL_LEN "${MAX_MODEL_LEN:-}"
+  write_profile_entry "$target_file.tmp" KV_CACHE_MEMORY_BYTES "${KV_CACHE_MEMORY_BYTES:-}"
   write_profile_entry "$target_file.tmp" GPU_UTIL "${GPU_UTIL:-}"
   write_profile_entry "$target_file.tmp" MAX_BATCHED_TOKENS "${MAX_BATCHED_TOKENS:-}"
   write_profile_entry "$target_file.tmp" MAX_NUM_SEQS "${MAX_NUM_SEQS:-}"
   write_profile_entry "$target_file.tmp" MTP_K "${MTP_K:-}"
+  write_profile_entry "$target_file.tmp" VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE:-}"
+  write_profile_entry "$target_file.tmp" VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS "${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS:-}"
+  write_profile_entry "$target_file.tmp" VLLM_TURBOQUANT_MAX_KV_SPLITS "${VLLM_TURBOQUANT_MAX_KV_SPLITS:-}"
+  write_profile_entry "$target_file.tmp" VLLM_TURBOQUANT_DECODE_BLOCK_KV "${VLLM_TURBOQUANT_DECODE_BLOCK_KV:-}"
   write_profile_entry "$target_file.tmp" MESSAGE_TYPE "${MESSAGE_TYPE:-}"
   write_profile_entry "$target_file.tmp" MM_LIMIT_JSON "${MM_LIMIT_JSON:-}"
   write_profile_entry "$target_file.tmp" LANGUAGE_MODEL_ONLY "${LANGUAGE_MODEL_ONLY:-}"
@@ -1419,7 +1943,6 @@ save_current_profile_menu() {
   write_profile_entry "$target_file.tmp" SPECULATIVE_CONFIG "${SPECULATIVE_CONFIG:-}"
   write_profile_entry "$target_file.tmp" ATTENTION_BACKEND "${ATTENTION_BACKEND:-}"
   write_profile_entry "$target_file.tmp" DISABLE_HYBRID_KV_CACHE_MANAGER "${DISABLE_HYBRID_KV_CACHE_MANAGER:-}"
-  write_profile_entry "$target_file.tmp" DISABLE_PREFIX_CACHING "${DISABLE_PREFIX_CACHING:-}"
   write_profile_entry "$target_file.tmp" DISABLE_CUSTOM_ALL_REDUCE "${DISABLE_CUSTOM_ALL_REDUCE:-}"
   mv "$target_file.tmp" "$target_file"
 
@@ -1711,16 +2234,21 @@ edit_advanced_parameters() {
   if [[ -n "${MM_LIMIT_JSON:-}" && "${MESSAGE_TYPE:-text-only}" == "text-only" ]]; then
     MESSAGE_TYPE=text+image
     LANGUAGE_MODEL_ONLY=0
-    SKIP_MM_PROFILING=${SKIP_MM_PROFILING:-0}
+    SKIP_MM_PROFILING=0
   fi
   LANGUAGE_MODEL_ONLY=$(prompt_toggle01 "Language-model only" "${LANGUAGE_MODEL_ONLY:-1}") || return 0
   SKIP_MM_PROFILING=$(prompt_toggle01 "Skip multimodal profiling" "${SKIP_MM_PROFILING:-1}") || return 0
   ENFORCE_EAGER=$(prompt_toggle01 "Enforce eager" "${ENFORCE_EAGER:-0}") || return 0
+  CONFIG_OVERRIDE_SOURCE["ENFORCE_EAGER"]=menu
+  unset 'CONFIG_OVERRIDE_UNSET[ENFORCE_EAGER]'
   NO_ASYNC_SCHEDULING=$(prompt_toggle01 "No async scheduling" "${NO_ASYNC_SCHEDULING:-0}") || return 0
   DISABLE_HYBRID_KV_CACHE_MANAGER=$(prompt_toggle01 "Disable hybrid KV cache manager" "${DISABLE_HYBRID_KV_CACHE_MANAGER:-0}") || return 0
   DISABLE_PREFIX_CACHING=$(prompt_toggle01 "Disable prefix caching" "${DISABLE_PREFIX_CACHING:-0}") || return 0
   DISABLE_CUSTOM_ALL_REDUCE=$(prompt_toggle01 "Disable custom all-reduce" "${DISABLE_CUSTOM_ALL_REDUCE:-0}") || return 0
   DISABLE_LOG_STATS=$(prompt_toggle01 "Disable log stats" "${DISABLE_LOG_STATS:-0}") || return 0
+  CONFIG_OVERRIDE_SOURCE["DISABLE_LOG_STATS"]=menu
+  unset 'CONFIG_OVERRIDE_UNSET[DISABLE_LOG_STATS]'
+  normalize_message_type_defaults
 }
 
 edit_runtime_parameters() {
@@ -1749,6 +2277,7 @@ edit_runtime_parameters() {
   fi
 
   MAX_MODEL_LEN=$(prompt_default "Context tokens" "${MAX_MODEL_LEN:-$(default_context_tokens)}") || return 0
+  KV_CACHE_MEMORY_BYTES=$(prompt_optional "KV cache memory bytes (empty = use GPU util)" "${KV_CACHE_MEMORY_BYTES:-}") || return 0
   GPU_UTIL=$(prompt_default "GPU memory utilization" "${GPU_UTIL:-$(default_gpu_util)}") || return 0
   MAX_BATCHED_TOKENS=$(prompt_default "Max batched tokens" "${MAX_BATCHED_TOKENS:-2048}") || return 0
   MAX_NUM_SEQS=$(prompt_default "Max concurrent sequences" "${MAX_NUM_SEQS:-1}") || return 0
@@ -1761,13 +2290,14 @@ edit_runtime_parameters() {
   if [[ "$MESSAGE_TYPE" == "text+image" ]]; then
     MM_LIMIT_JSON=${MM_LIMIT_JSON:-'{"image":1,"video":0,"audio":0}'}
     LANGUAGE_MODEL_ONLY=0
-    SKIP_MM_PROFILING=${SKIP_MM_PROFILING:-0}
+    SKIP_MM_PROFILING=0
   else
     MM_LIMIT_JSON=""
     LANGUAGE_MODEL_ONLY=1
     SKIP_MM_PROFILING=1
   fi
   edit_advanced_parameters
+  normalize_message_type_defaults
 
   save_manager_state
 }
@@ -1792,21 +2322,40 @@ edit_message_type_menu() {
   if [[ "$MESSAGE_TYPE" == "text+image" ]]; then
     MM_LIMIT_JSON=${MM_LIMIT_JSON:-'{"image":1,"video":0,"audio":0}'}
     LANGUAGE_MODEL_ONLY=0
-    SKIP_MM_PROFILING=${SKIP_MM_PROFILING:-0}
+    SKIP_MM_PROFILING=0
   else
     MM_LIMIT_JSON=""
     LANGUAGE_MODEL_ONLY=1
     SKIP_MM_PROFILING=1
   fi
+  normalize_message_type_defaults
+  save_manager_state
+}
+
+edit_prefix_cache_menu() {
+  local choice
+
+  choice=$(menu_select "Prefix cache" "$(current_prefix_cache_label)" enabled disabled) || return 0
+  case "$choice" in
+    disabled)
+      DISABLE_PREFIX_CACHING=1
+      ENABLE_PREFIX_CACHING=0
+      ;;
+    *)
+      ENABLE_PREFIX_CACHING=1
+      DISABLE_PREFIX_CACHING=0
+      ENABLE_PROMPT_TOKENS_DETAILS=1
+      ;;
+  esac
   save_manager_state
 }
 
 runtime_parameter_menu() {
   local selected choices=()
   local model_family_value profile_group_value model_variant_value served_name_value
-  local quantization_value kv_value context_value gpu_util_value
+  local quantization_value kv_value context_value kv_cache_memory_value gpu_util_value
   local batch_tokens_value max_sequences_value mtp_value message_type_value
-  local template_value reasoning_value tool_calling_value
+  local template_value reasoning_value tool_calling_value prefix_cache_value
 
   while true; do
     model_family_value=$(menu_value "${MODEL_FAMILY:-$(guess_model_family "${MODEL_DIR:-}")}")
@@ -1816,7 +2365,11 @@ runtime_parameter_menu() {
     quantization_value=$(menu_value "${QUANTIZATION:-auto}")
     kv_value=$(menu_value "${KV_CACHE_DTYPE:-fp16}")
     context_value=$(menu_value "${MAX_MODEL_LEN:-$(default_context_tokens)}")
+    kv_cache_memory_value=$(menu_value "${KV_CACHE_MEMORY_BYTES:-auto}")
     gpu_util_value=$(menu_value "${GPU_UTIL:-$(default_gpu_util)}")
+    if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
+      gpu_util_value="${gpu_util_value} (fallback)"
+    fi
     batch_tokens_value=$(menu_value "${MAX_BATCHED_TOKENS:-2048}")
     max_sequences_value=$(menu_value "${MAX_NUM_SEQS:-1}")
     mtp_value=$(menu_value "${MTP_K:-0}")
@@ -1824,6 +2377,7 @@ runtime_parameter_menu() {
     template_value=$(menu_value "$(current_template_label)")
     reasoning_value=$(menu_value "$(current_reasoning_label)")
     tool_calling_value=$(menu_value "$(current_tool_calling_label)")
+    prefix_cache_value=$(menu_value "$(current_prefix_cache_label)")
 
     if is_tty; then
       clear >/dev/tty 2>/dev/null || true
@@ -1839,6 +2393,7 @@ runtime_parameter_menu() {
       "vLLM --quantization: $quantization_value"
       "KV precision: $kv_value"
       "Context tokens: $context_value"
+      "KV cache memory bytes: $kv_cache_memory_value"
       "GPU util: $gpu_util_value"
       "Batch tokens: $batch_tokens_value"
       "Max sequences: $max_sequences_value"
@@ -1847,6 +2402,7 @@ runtime_parameter_menu() {
       "Chat template: $template_value"
       "Reasoning defaults: $reasoning_value"
       "Tool calling: $tool_calling_value"
+      "Prefix cache: $prefix_cache_value"
       "Advanced options"
       "Edit all fields"
       "Return"
@@ -1880,6 +2436,10 @@ runtime_parameter_menu() {
         MAX_MODEL_LEN=$(prompt_default "Context tokens" "${MAX_MODEL_LEN:-$(default_context_tokens)}") || continue
         save_manager_state
         ;;
+      "KV cache memory bytes:"*)
+        KV_CACHE_MEMORY_BYTES=$(prompt_optional "KV cache memory bytes (empty = use GPU util)" "${KV_CACHE_MEMORY_BYTES:-}") || continue
+        save_manager_state
+        ;;
       "GPU util:"*)
         GPU_UTIL=$(prompt_default "GPU memory utilization" "${GPU_UTIL:-$(default_gpu_util)}") || continue
         save_manager_state
@@ -1907,6 +2467,9 @@ runtime_parameter_menu() {
         ;;
       "Tool calling:"*)
         edit_tool_calling_menu
+        ;;
+      "Prefix cache:"*)
+        edit_prefix_cache_menu
         ;;
       "Advanced options")
         edit_advanced_parameters
@@ -2460,31 +3023,53 @@ default_gpu_util() {
   fi
 }
 
+set_derived_default() {
+  local key=$1
+  local value=$2
+  config_key_has_explicit_value "$key" && return 0
+  if [[ -n "${!key+x}" && -n "${!key}" ]]; then
+    return 0
+  fi
+  printf -v "$key" '%s' "$value"
+  export "$key"
+}
+
+set_mode_default() {
+  local key=$1
+  local value=$2
+  config_key_has_explicit_value "$key" && return 0
+  printf -v "$key" '%s' "$value"
+  export "$key"
+  CONFIG_OVERRIDE_SOURCE["$key"]=mode
+  unset "CONFIG_OVERRIDE_UNSET[$key]"
+}
+
 apply_mode() {
   normalize_mode
   case "$MODE" in
     normal)
-      export ENFORCE_EAGER=0
-      export DISABLE_LOG_STATS=1
-      export VLLM_SM75_SPEC_SYNC_MODE=safe
-      export VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=0
+      set_mode_default ENFORCE_EAGER 0
+      set_mode_default DISABLE_LOG_STATS 1
+      set_mode_default VLLM_SM75_SPEC_SYNC_MODE safe
+      set_mode_default VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH 0
       ;;
     fast)
-      export ENFORCE_EAGER=0
-      export DISABLE_LOG_STATS=1
-      export VLLM_SM75_SPEC_SYNC_MODE=safe
-      export VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1
+      set_mode_default ENFORCE_EAGER 0
+      set_mode_default DISABLE_LOG_STATS 1
+      set_mode_default VLLM_SM75_SPEC_SYNC_MODE safe
+      set_mode_default VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH 1
       ;;
     aggressive)
-      export ENFORCE_EAGER=0
-      export DISABLE_LOG_STATS=1
-      export VLLM_SM75_SPEC_SYNC_MODE=nosync
-      export VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1
+      set_mode_default ENFORCE_EAGER 0
+      set_mode_default DISABLE_LOG_STATS 1
+      set_mode_default VLLM_SM75_SPEC_SYNC_MODE nosync
+      set_mode_default VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH 1
       ;;
     safe)
-      export ENFORCE_EAGER=1
-      export VLLM_SM75_SPEC_SYNC_MODE=safe
-      export VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=0
+      set_mode_default ENFORCE_EAGER 1
+      set_mode_default DISABLE_LOG_STATS 0
+      set_mode_default VLLM_SM75_SPEC_SYNC_MODE safe
+      set_mode_default VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH 0
       ;;
     *)
       die "MODE must be safe, normal, fast, or aggressive."
@@ -2510,7 +3095,7 @@ validate_mode_kv_policy() {
         ;;
     esac
     if [[ "$MODE" == "aggressive" ]]; then
-      [[ "$candidate" == "fast" ]] && mode_ok=1 && break
+      [[ "$candidate" == "fast" || "$candidate" == "aggressive" ]] && mode_ok=1 && break
       continue
     fi
     if [[ "$candidate" == "$MODE" ]]; then
@@ -2588,20 +3173,41 @@ set_sm75_runtime_env() {
     export VLLM_INT8KV_FA_CASCADE_TILE_TOKENS=${VLLM_INT8KV_FA_CASCADE_TILE_TOKENS:-65536}
   fi
   if [[ "${KV_CACHE_DTYPE:-}" == turboquant_* ]]; then
+    local tq_continuation_reserve_default=65536
+    if [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+      local tq_max_model_len=${MAX_MODEL_LEN:-0}
+      local tq_max_num_seqs=${MAX_NUM_SEQS:-1}
+      if [[ "$tq_max_model_len" =~ ^[0-9]+$ && "$tq_max_num_seqs" =~ ^[0-9]+$ ]] \
+        && (( tq_max_model_len >= 240000 )) \
+        && (( tq_max_num_seqs <= 1 )); then
+        # Long single-seq TQ continuation/prefix-cache lanes need the larger
+        # workspace reserved up front; otherwise the first large continuation
+        # grows the workspace at runtime and can trip OOM or bad split paths.
+        tq_continuation_reserve_default=262144
+      fi
+    fi
     export VLLM_TURBOQUANT_USE_FLASHINFER_PREFILL=${VLLM_TURBOQUANT_USE_FLASHINFER_PREFILL:-1}
     export VLLM_TURBOQUANT_FLASHINFER_BACKEND=${VLLM_TURBOQUANT_FLASHINFER_BACKEND:-fa2}
-    export VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS=${VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS:-65536}
+    export VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE=${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE:-auto}
+    export VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS=${VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS:-20480}
+    export VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS=${VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS:-$tq_continuation_reserve_default}
     export VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE=${VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE:-1}
     export VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK=${VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK:-512}
     export VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS=${VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS:-16777216}
     export VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH=${VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH:-1}
+    if [[ -n "${VLLM_TURBOQUANT_MAX_KV_SPLITS:-}" ]]; then
+      export VLLM_TURBOQUANT_MAX_KV_SPLITS
+    fi
+    export VLLM_TURBOQUANT_DECODE_BLOCK_KV=${VLLM_TURBOQUANT_DECODE_BLOCK_KV:-2}
   fi
-  # Keep generated kernels inside this runtime tree. Reusing cache dirs from
-  # experiment worktrees can leave absolute paths to deleted environments.
-  export TORCHINDUCTOR_CACHE_DIR="$MANAGER_ROOT/torchinductor-cache"
-  export TRITON_CACHE_DIR="$MANAGER_ROOT/triton-cache"
+  # Keep generated kernels inside this runtime tree by default. Reusing cache
+  # dirs from experiment worktrees can leave absolute paths to deleted
+  # environments, but explicit overrides are useful when the runtime tree is on
+  # a constrained filesystem.
+  export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-"$MANAGER_ROOT/torchinductor-cache"}
+  export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-"$MANAGER_ROOT/triton-cache"}
   export PYTHONUNBUFFERED=1
-  if [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" ]]; then
+  if [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" ]] && ! config_key_has_explicit_value VLLM_ENFORCE_STRICT_TOOL_CALLING; then
     export VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-1}
   fi
   if [[ -n "${REASONING_BUDGET:-}" ]]; then
@@ -2622,7 +3228,6 @@ build_args() {
     --dtype half
     --tensor-parallel-size "${TP_SIZE:-2}"
     --generation-config vllm
-    --gpu-memory-utilization "$GPU_UTIL"
     --max-model-len "$MAX_MODEL_LEN"
     --enable-chunked-prefill
     --max-num-seqs "$MAX_NUM_SEQS"
@@ -2631,13 +3236,24 @@ build_args() {
 
   [[ -n "${QUANTIZATION:-}" ]] && VLLM_ARGS+=(--quantization "$QUANTIZATION")
   [[ -n "${KV_CACHE_DTYPE:-}" ]] && VLLM_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+  if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
+    VLLM_ARGS+=(--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")
+  else
+    VLLM_ARGS+=(--gpu-memory-utilization "$GPU_UTIL")
+  fi
   [[ -n "${MAMBA_CACHE_MODE:-}" ]] && VLLM_ARGS+=(--mamba-cache-mode "$MAMBA_CACHE_MODE")
   [[ "${ENFORCE_EAGER:-0}" == "1" ]] && VLLM_ARGS+=(--enforce-eager)
   [[ "${NO_ASYNC_SCHEDULING:-0}" == "1" ]] && VLLM_ARGS+=(--no-async-scheduling)
   [[ "${DISABLE_HYBRID_KV_CACHE_MANAGER:-0}" == "1" ]] && VLLM_ARGS+=(--disable-hybrid-kv-cache-manager)
-  [[ "${DISABLE_PREFIX_CACHING:-0}" == "1" ]] && VLLM_ARGS+=(--no-enable-prefix-caching)
+  if [[ "${DISABLE_PREFIX_CACHING:-0}" == "1" ]]; then
+    VLLM_ARGS+=(--no-enable-prefix-caching)
+  elif [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+    VLLM_ARGS+=(--enable-prefix-caching)
+  fi
+  [[ "${ENABLE_PROMPT_TOKENS_DETAILS:-1}" == "1" ]] && VLLM_ARGS+=(--enable-prompt-tokens-details)
   [[ "${LANGUAGE_MODEL_ONLY:-0}" == "1" ]] && VLLM_ARGS+=(--language-model-only)
   [[ "${SKIP_MM_PROFILING:-0}" == "1" ]] && VLLM_ARGS+=(--skip-mm-profiling)
+  [[ "${ALLOWED_ORIGINS:-}" != "" ]] && VLLM_ARGS+=(--allowed-origins "${ALLOWED_ORIGINS}")
   [[ "${DISABLE_CUSTOM_ALL_REDUCE:-0}" == "1" ]] && VLLM_ARGS+=(--disable-custom-all-reduce)
   [[ "${DISABLE_LOG_STATS:-0}" == "1" ]] && VLLM_ARGS+=(--disable-log-stats)
   [[ -n "${ATTENTION_BACKEND:-}" ]] && VLLM_ARGS+=(--attention-backend "$ATTENTION_BACKEND")
@@ -2870,6 +3486,101 @@ wait_for_ready() {
   return 2
 }
 
+cold_compile_admission_failure() {
+  local log_file=$1
+
+  [[ "${VLLM_COMPILE_PREWARM_RETRY:-0}" != "1" ]] || return 1
+  [[ "${VLLM_COMPILE_PREWARM:-1}" != "0" ]] || return 1
+  [[ -s "$log_file" ]] || return 1
+
+  grep -qE 'To serve at least one request.*max seq len|estimated maximum model length is [0-9]+' "$log_file" 2>/dev/null || return 1
+  grep -qE 'Compiling a graph|Cache the graph of compile range|saved AOT compiled function|Dynamo bytecode transform time' "$log_file" 2>/dev/null || return 1
+  return 0
+}
+
+cold_compile_prewarm_len() {
+  local log_file=$1
+  local target=${MAX_MODEL_LEN:-0}
+  local estimate len
+
+  [[ "$target" =~ ^[0-9]+$ && "$target" -gt 0 ]] || return 1
+  estimate=$(grep -Eo 'estimated maximum model length is [0-9]+' "$log_file" 2>/dev/null | awk '{print $NF}' | tail -n 1)
+  if [[ "$estimate" =~ ^[0-9]+$ && "$estimate" -gt 4096 ]]; then
+    len=$((estimate - 4096))
+  else
+    len=$((target * 4 / 5))
+  fi
+  (( len > 4096 )) || return 1
+  len=$((len / 1024 * 1024))
+  (( len >= 4096 && len < target )) || return 1
+  echo "$len"
+}
+
+run_compile_prewarm() {
+  local host_arg=$1
+  local url_host=$2
+  local prewarm_len=$3
+  local original_len=$MAX_MODEL_LEN
+  local original_name=$SERVED_NAME
+  local original_pid=${CURRENT_SERVER_PID:-}
+  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0
+
+  prewarm_name="${SERVED_NAME}-compile-prewarm-${prewarm_len}"
+  prewarm_safe=$(printf '%s' "$prewarm_name" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_*$//')
+  [[ -n "$prewarm_safe" ]] || prewarm_safe="vllm-compile-prewarm"
+  prewarm_log="$LOG_DIR/vllm-${prewarm_safe}-${STAMP}.log"
+  prewarm_pid_file="$LOG_DIR/vllm-${prewarm_safe}.pid"
+
+  MAX_MODEL_LEN=$prewarm_len
+  SERVED_NAME=$prewarm_name
+  build_args "$host_arg"
+  printf -v args_text '%q ' "${VLLM_ARGS[@]}"
+
+  {
+    echo "============================================================"
+    echo "$PROJECT_NAME v$VERSION compile prewarm"
+    echo "Launch time: $(date '+%F %T %Z')"
+    echo "Original served name: $original_name"
+    echo "Original max model len: $original_len"
+    echo "Prewarm max model len: $prewarm_len"
+    echo "Model: $MODEL_DIR"
+    echo "Mode: $MODE"
+    echo "GPU devices: ${GPU_DEVICES:-}"
+    echo "TP size: ${TP_SIZE:-}"
+    echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
+    echo "============================================================"
+  } > "$prewarm_log"
+
+  echo
+  echo "Cold compile admission failure detected."
+  echo "Running compile prewarm at max_model_len=$prewarm_len, then retrying the original $original_len context."
+  echo "  Prewarm log: $prewarm_log"
+
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+  else
+    nohup "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+  fi
+  CURRENT_SERVER_PID=$!
+  echo "$CURRENT_SERVER_PID" > "$prewarm_pid_file"
+
+  wait_for_ready "$prewarm_log" "$url_host" || ready_rc=$?
+  cleanup_failed_launch "$prewarm_pid_file" || true
+
+  MAX_MODEL_LEN=$original_len
+  SERVED_NAME=$original_name
+  CURRENT_SERVER_PID=$original_pid
+  build_args "$host_arg"
+
+  if [[ "$ready_rc" == "0" ]]; then
+    echo "Compile prewarm: OK"
+    return 0
+  fi
+
+  echo "Compile prewarm failed. See: $prewarm_log" >&2
+  return 1
+}
+
 smoke_test() {
   local url_host=$1
   local model_id model_output
@@ -2969,6 +3680,7 @@ launch_server() {
   fi
 
   check_checkpoint_mmap_policy || return 1
+  warn_display_gpu_occupancy || true
 
   {
     echo "============================================================"
@@ -2987,6 +3699,7 @@ launch_server() {
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
+    echo "TQ diagnostics: $(current_tq_diagnostics_label)"
     echo "Strict tool calling: VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}"
     echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
     echo "============================================================"
@@ -2997,6 +3710,7 @@ launch_server() {
   echo "  Log: $log_file"
   echo "  Mode: $MODE"
   echo "  MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
+  echo "  TQ diagnostics: $(current_tq_diagnostics_label)"
   echo "  Strict tool calling: VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}"
   echo "  Served name: $SERVED_NAME"
   echo "  Model: $MODEL_DIR"
@@ -3013,6 +3727,24 @@ launch_server() {
   local ready_rc=0
   wait_for_ready "$log_file" "$url_host" || ready_rc=$?
   if [[ "$ready_rc" != "0" ]]; then
+    local prewarm_len retry_rc
+    if cold_compile_admission_failure "$log_file"; then
+      prewarm_len=$(cold_compile_prewarm_len "$log_file" || true)
+      if [[ -n "$prewarm_len" ]]; then
+        cleanup_failed_launch "$pid_file"
+        if run_compile_prewarm "$host_arg" "$url_host" "$prewarm_len"; then
+          echo
+          echo "Retrying original launch after compile prewarm..."
+          local old_stamp=$STAMP
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          VLLM_COMPILE_PREWARM_RETRY=1 launch_server
+          retry_rc=$?
+          STAMP=$old_stamp
+          unset VLLM_COMPILE_PREWARM_RETRY
+          return "$retry_rc"
+        fi
+      fi
+    fi
     echo
     echo "START FAILED"
     echo "Log: $log_file"
@@ -3234,25 +3966,17 @@ prepare_runtime_defaults() {
   MODE=${MODE:-normal}
   normalize_mode
   SERVICE_SCOPE=${SERVICE_SCOPE:-local}
-  if [[ -z "${MESSAGE_TYPE:-}" && -n "${MM_LIMIT_JSON:-}" ]]; then
-    MESSAGE_TYPE=text+image
-  else
-    MESSAGE_TYPE=${MESSAGE_TYPE:-text-only}
-  fi
-  if [[ "$MESSAGE_TYPE" == "text+image" ]]; then
-    MM_LIMIT_JSON=${MM_LIMIT_JSON:-'{"image":1,"video":0,"audio":0}'}
-    LANGUAGE_MODEL_ONLY=${LANGUAGE_MODEL_ONLY:-0}
-    SKIP_MM_PROFILING=${SKIP_MM_PROFILING:-0}
-  else
-    MM_LIMIT_JSON=""
-    LANGUAGE_MODEL_ONLY=1
-    SKIP_MM_PROFILING=1
-  fi
+  normalize_message_type_defaults
+  apply_prefix_cache_defaults
   ENABLE_AUTO_TOOL_CHOICE=$(normalize_bool "${ENABLE_AUTO_TOOL_CHOICE:-0}")
   apply_family_reasoning_defaults
   if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
-    TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_xml}
-    VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-1}
+    if ! config_key_has_explicit_value TOOL_CALL_PARSER; then
+      TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_xml}
+    fi
+    if ! config_key_has_explicit_value VLLM_ENFORCE_STRICT_TOOL_CALLING; then
+      VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-1}
+    fi
   fi
   validate_mode_kv_policy
 }
@@ -3272,6 +3996,11 @@ print_review() {
   banner
   local message_type=text-only
   [[ -n "${MM_LIMIT_JSON:-}" ]] && message_type=text+image
+  local kv_cache_memory_label=${KV_CACHE_MEMORY_BYTES:-auto}
+  local gpu_util_label=$GPU_UTIL
+  if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
+    gpu_util_label="$GPU_UTIL (fallback, ignored)"
+  fi
 
   cat <<EOF
 Launch summary:
@@ -3284,9 +4013,12 @@ Launch summary:
   W/A type:             $(guess_precision_scheme "$MODEL_DIR" "${QUANTIZATION:-}")
   GPU devices:          ${GPU_DEVICES:-$(detect_default_gpu_devices)}
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
+  TQ diagnostics:       $(current_tq_diagnostics_label)
+  Prefix cache:         $(current_prefix_cache_label)
   Mamba cache mode:     ${MAMBA_CACHE_MODE:-auto}
   Context tokens:       $MAX_MODEL_LEN
-  GPU util:             $GPU_UTIL
+  KV cache memory:      $kv_cache_memory_label
+  GPU util:             $gpu_util_label
   Max batched tokens:   $MAX_BATCHED_TOKENS
   Max sequences:        $MAX_NUM_SEQS
   MTP tokens:           $MTP_K
@@ -3294,6 +4026,7 @@ Launch summary:
   Chat template:        $(current_template_label)
   Reasoning default:    $(current_reasoning_label)
   Tool calling:         $(current_tool_calling_label)
+  Prompt details:       ${ENABLE_PROMPT_TOKENS_DETAILS:-1}
   Mode:                 $MODE
   MTP graph policy:     VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}
   Strict tool calling:  VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}
@@ -3362,9 +4095,14 @@ render_main_menu_item() {
 
 render_main_menu() {
   local current=${1:-1}
-  local gpu_devices tp_size
+  local gpu_devices tp_size kv_cache_memory_label gpu_util_label
   gpu_devices=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   tp_size=${TP_SIZE:-$(gpu_device_count "$gpu_devices")}
+  kv_cache_memory_label=${KV_CACHE_MEMORY_BYTES:-auto}
+  gpu_util_label=${GPU_UTIL:-$(default_gpu_util)}
+  if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
+    gpu_util_label="${gpu_util_label} (fallback)"
+  fi
 
   if is_tty; then
     clear >/dev/tty 2>/dev/null || true
@@ -3380,8 +4118,10 @@ render_main_menu() {
   printf '     vLLM quant:       %s\n' "$(menu_value "${QUANTIZATION:-auto}")"
   printf '     W/A type:         %s\n' "$(menu_value "$(guess_precision_scheme "${MODEL_DIR:-}" "${QUANTIZATION:-}")")"
   printf '     KV precision:     %s\n' "$(menu_value "${KV_CACHE_DTYPE:-fp16}")"
+  printf '     Prefix cache:     %s\n' "$(menu_value "$(current_prefix_cache_label)")"
   printf '     Context tokens:   %s\n' "$(menu_value "${MAX_MODEL_LEN:-$(default_context_tokens)}")"
-  printf '     GPU util:         %s\n' "$(menu_value "${GPU_UTIL:-$(default_gpu_util)}")"
+  printf '     KV cache memory:  %s\n' "$(menu_value "$kv_cache_memory_label")"
+  printf '     GPU util:         %s\n' "$(menu_value "$gpu_util_label")"
   printf '     Batch tokens:     %s\n' "$(menu_value "${MAX_BATCHED_TOKENS:-2048}")"
   printf '     Max sequences:    %s\n' "$(menu_value "${MAX_NUM_SEQS:-1}")"
   printf '     MTP tokens:       %s\n' "$(menu_value "${MTP_K:-0}")"
@@ -3542,10 +4282,6 @@ has_arg() {
 }
 
 run_start_flow() {
-  local profile_file
-  if profile_file=$(resolve_profile_file); then
-    apply_profile_overrides "$profile_file"
-  fi
   collect_config_env
   apply_mode
   set_sm75_runtime_env
@@ -3560,10 +4296,16 @@ run_start_flow() {
 main() {
   cd "$MANAGER_ROOT"
 
-  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  if has_arg "--help" "$@" || has_arg "-h" "$@"; then
     show_help
     exit 0
   fi
+
+  parse_launcher_args "$@"
+  register_env_config_overrides
+  apply_launcher_path_defaults
+  NON_INTERACTIVE=$(normalize_bool "${NON_INTERACTIVE:-0}")
+  PRINT_CONFIG=$(normalize_bool "${PRINT_CONFIG:-0}")
 
   if [[ ! -x "$RUNTIME_ROOT/.venv/bin/python" ]]; then
     banner
@@ -3572,7 +4314,7 @@ main() {
 
   mkdir -p "$LOG_DIR"
 
-  if [[ "${1:-}" == "--non-interactive" || "${1:-}" == "--print-config" || "${NON_INTERACTIVE:-0}" == "1" || ! -t 0 ]]; then
+  if [[ "${NON_INTERACTIVE:-0}" == "1" || "${PRINT_CONFIG:-0}" == "1" || ! -t 0 ]]; then
     run_start_flow "$@"
   else
     service_manager

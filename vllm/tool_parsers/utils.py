@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
+import math
+import warnings
 import json
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -494,3 +496,149 @@ def compute_tool_delta(
         if arg_diff
         else None
     )
+import json
+from typing import Any
+
+
+def _is_json_finite(obj: Any) -> bool:
+    """Whether *obj* can be serialized to valid JSON."""
+    try:
+        json.dumps(obj, allow_nan=False)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def extract_types_from_schema(schema: Any) -> list[str]:
+    """Extract all possible type strings from a JSON Schema definition."""
+    if schema is None or not isinstance(schema, dict):
+        return ["string"]
+
+    types: set[str] = set()
+
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            types.add(type_value)
+        elif isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str):
+                    types.add(t)
+
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        for value in schema["enum"]:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        if choice_field in schema and isinstance(schema[choice_field], list):
+            for choice in schema[choice_field]:
+                types.update(extract_types_from_schema(choice))
+
+    return list(types) if types else ["string"]
+
+
+_TYPE_ALIASES: dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "uint32": "integer",
+    "uint64": "integer",
+    "long": "integer",
+    "short": "integer",
+    "unsigned": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
+}
+
+
+def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
+    """Best-effort coercion of a raw string value to a JSON Schema type."""
+    if isinstance(schema_type, str):
+        schema_type = [schema_type]
+
+    normalized_types = {
+        _TYPE_ALIASES.get(key, key) for t in schema_type for key in [t.strip().lower()]
+    }
+
+    type_priority = [
+        "null",
+        "integer",
+        "number",
+        "boolean",
+        "object",
+        "array",
+        "string",
+    ]
+
+    for candidate_type in type_priority:
+        if candidate_type not in normalized_types:
+            continue
+
+        if candidate_type == "null":
+            if value.lower() == "null":
+                return None
+            continue
+        if candidate_type == "string":
+            return value
+        if candidate_type == "integer":
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                continue
+        if candidate_type == "number":
+            try:
+                val = float(value)
+            except (ValueError, TypeError):
+                continue
+            if not math.isfinite(val):
+                continue
+            return val if val != int(val) else int(val)
+        if candidate_type == "boolean":
+            lower_val = value.lower().strip()
+            if lower_val in ("true", "1"):
+                return True
+            if lower_val in ("false", "0"):
+                return False
+            continue
+        if candidate_type in ("object", "array"):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if _is_json_finite(parsed):
+                return parsed
+            continue
+
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if not _is_json_finite(parsed):
+        return value
+    return parsed
