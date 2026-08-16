@@ -249,8 +249,14 @@ class OffloadingConnectorScheduler:
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
-            pending = self._block_id_to_pending_jobs[bid]
-            pending.remove(job_id)
+            # A block can be reallocated and its pending-store entry flushed
+            # before the worker completion arrives. Completion is still
+            # valid; do not take down EngineCore while cleaning up that stale
+            # bookkeeping entry.
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                continue
+            pending.discard(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 

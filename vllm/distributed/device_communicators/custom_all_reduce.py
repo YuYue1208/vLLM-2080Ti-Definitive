@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -296,6 +297,23 @@ class CustomAllreduce:
                 "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE must be one of "
                 f"auto, registered, or staging. Got {graph_input_mode!r}."
             )
+
+        # CUDA IPC cannot export graph-private tensors allocated from
+        # PyTorch expandable segments (cudaIpcGetMemHandle returns
+        # cudaErrorInvalidValue). Keep the custom all-reduce kernel enabled,
+        # but route graph inputs through its pre-registered cudaMalloc staging
+        # buffer. Explicit "registered" mode above remains an opt-in override.
+        allocator_conf = ",".join(
+            filter(
+                None,
+                (
+                    os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+                    os.environ.get("PYTORCH_ALLOC_CONF"),
+                ),
+            )
+        )
+        if "expandable_segments:true" in allocator_conf.replace(" ", "").lower():
+            return False
 
         # Full decode graphs keep the fast registered-input path. SM75
         # piecewise/prefill captures may allocate graph-private large buffers

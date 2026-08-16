@@ -743,6 +743,18 @@ class VllmConfig:
         if self.model_config is not None and self.model_config.enable_sleep_mode:
             return
 
+        # The in-process CPU offload connectors do not register GPU memory
+        # with an external transport. They resolve the persistent KV tensor
+        # addresses for each local CUDA copy, while only the CPU backing store
+        # is pinned. Expandable segments are therefore safe for these local
+        # connectors and are useful for avoiding activation-pool fragmentation
+        # during large chunked-prefill batches.
+        if self.kv_transfer_config.kv_connector in {
+            "OffloadingConnector",
+            "SimpleCPUOffloadConnector",
+        }:
+            return
+
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
             "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
