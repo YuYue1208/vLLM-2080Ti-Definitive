@@ -282,12 +282,22 @@ class ThinkingBudgetStateHolder:
             and state["end_thinking"] > state["start_thinking"]
             and not state.get("continue_thinking", False)
         ):
+            output_length = len(state.get("output_tok_ids", []))
+            end_boundary = state["end_thinking"] + len(
+                self.think_end_token_ids
+            )
             state["in_think"] = False
             state["think_count"] = 0
             state["continue_thinking"] = False
             state["start_thinking"] = -1
             state["end_thinking"] = -1
-            state["scan_offset"] = len(state.get("output_tok_ids", []))
+            # Resume scanning immediately after this end marker.  The tail
+            # may already contain a complete next <think> marker or only its
+            # prefix; advancing to the output length would lose either case.
+            state["scan_offset"] = min(
+                output_length, max(0, end_boundary)
+            )
+            state["prev_output_length"] = output_length
             state["check_count_down"] = state["thinking_token_budget"]
             return
 
@@ -395,7 +405,11 @@ class ThinkingBudgetStateHolder:
                     state["continue_thinking"] = False
                     state["start_thinking"] = -1
                     state["end_thinking"] = -1
-                    state["scan_offset"] = len(state.get("output_tok_ids", []))
+                    state["scan_offset"] = min(
+                        current_length,
+                        max(0, absolute_end_pos + len(self.think_end_token_ids)),
+                    )
+                    state["prev_output_length"] = current_length
 
             elif absolute_start_pos >= 0 and not state["continue_thinking"]:
                 # Found think start - entering think mode
@@ -410,7 +424,11 @@ class ThinkingBudgetStateHolder:
                 state["continue_thinking"] = False
                 state["start_thinking"] = -1
                 state["end_thinking"] = -1
-                state["scan_offset"] = len(state.get("output_tok_ids", []))
+                state["scan_offset"] = min(
+                    current_length,
+                    max(0, absolute_end_pos + len(self.think_end_token_ids)),
+                )
+                state["prev_output_length"] = current_length
 
             elif state["in_think"]:
                 # Continue thinking mode, increment count by new tokens

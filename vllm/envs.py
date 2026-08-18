@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
+    VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
     VLLM_TURBOQUANT_SKIP_PREFILL_STORE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -538,6 +539,26 @@ def get_env_or_set_default(
 # --8<-- [start:env-vars-definition]
 
 logger = logging.getLogger(__name__)
+
+
+def is_expandable_segments_enabled() -> bool:
+    """Return whether PyTorch expandable CUDA segments are enabled.
+
+    PyTorch accepts both allocator environment variable names.  Keep the
+    spelling and boolean parsing in one place so config validation, allocator
+    setup, and CUDA-graph handling cannot disagree.
+    """
+    for env_name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        allocator_conf = os.environ.get(env_name, "")
+        for item in allocator_conf.split(","):
+            key, separator, value = item.partition(":")
+            if (
+                separator
+                and key.strip().lower() == "expandable_segments"
+                and value.strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                return True
+    return False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
@@ -1131,6 +1152,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
     ).lower(),
+    "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
+        "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+    ).strip().lower()
+    in {"1", "true", "yes", "on"},
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection

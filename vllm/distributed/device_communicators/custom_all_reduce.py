@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -303,16 +302,7 @@ class CustomAllreduce:
         # cudaErrorInvalidValue). Keep the custom all-reduce kernel enabled,
         # but route graph inputs through its pre-registered cudaMalloc staging
         # buffer. Explicit "registered" mode above remains an opt-in override.
-        allocator_conf = ",".join(
-            filter(
-                None,
-                (
-                    os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
-                    os.environ.get("PYTORCH_ALLOC_CONF"),
-                ),
-            )
-        )
-        if "expandable_segments:true" in allocator_conf.replace(" ", "").lower():
+        if envs.is_expandable_segments_enabled():
             return False
 
         # Full decode graphs keep the fast registered-input path. SM75
