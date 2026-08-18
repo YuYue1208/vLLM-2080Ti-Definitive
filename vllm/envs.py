@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
+    VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -1131,6 +1132,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
     ).lower(),
+    "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
+        "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+    ).strip().lower()
+    in {"1", "true", "yes", "on"},
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
