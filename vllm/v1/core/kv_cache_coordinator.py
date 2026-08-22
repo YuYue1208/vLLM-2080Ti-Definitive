@@ -152,13 +152,33 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
+        # A running request is already tracked and cannot acquire new prefix
+        # hits. Keep the old fast path coordinator-wide so every group agrees
+        # whether this is a first allocation.
+        if any(
+            request_id in manager.num_cached_block
+            for manager in self.single_type_managers
+        ):
+            assert all(len(blocks) == 0 for blocks in new_computed_blocks)
+            return
+
+        # Two phases are required for hybrid caches. Touch every group's local
+        # hits before any external allocation can evict an as-yet untouched hit
+        # owned by another group (vLLM #43884 / #44409).
         for i, manager in enumerate(self.single_type_managers):
-            manager.allocate_new_computed_blocks(
+            manager.add_local_computed_blocks(
                 request_id,
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
+        if num_external_computed_tokens > 0:
+            for manager in self.single_type_managers:
+                manager.allocate_external_computed_blocks(
+                    request_id,
+                    num_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
 
     def allocate_new_blocks(
         self,
@@ -543,12 +563,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
-                use_eagle = (
+                drop_eagle_block = (
                     idx in self.eagle_attn_group_indices and idx not in eagle_verified
+                    and spec.supports_eagle_cache_peek
                 )
 
                 _max_length = curr_hit_length
-                if use_eagle:
+                if drop_eagle_block:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
@@ -559,16 +580,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
-                    use_eagle=use_eagle,
+                    use_eagle=drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
-                if use_eagle:
+                if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
-                curr_hit_length = _new_hit_length
+                curr_hit_length = min(curr_hit_length, _new_hit_length)
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 

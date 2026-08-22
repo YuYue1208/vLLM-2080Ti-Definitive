@@ -736,11 +736,26 @@ class VllmConfig:
         # expandable_segments off around its pool (see #40812), so the KV
         # cache allocated within that context lands on stable physical pages
         # even when the env var is set.
-        if "expandable_segments:True" not in os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", ""
-        ):
+        if not envs.is_expandable_segments_enabled():
             return
         if self.model_config is not None and self.model_config.enable_sleep_mode:
+            return
+
+        # The in-process CPU offload connectors do not register GPU memory
+        # with an external transport. They resolve the persistent KV tensor
+        # addresses for each local CUDA copy, while only the CPU backing store
+        # is pinned. Expandable segments are therefore safe for these local
+        # connectors and are useful for avoiding activation-pool fragmentation
+        # during large chunked-prefill batches.
+        connector = self.kv_transfer_config.kv_connector
+        extra_config = self.kv_transfer_config.kv_connector_extra_config or {}
+        if connector in {
+            "SimpleCPUOffloadConnector",
+        } or (
+            connector == "OffloadingConnector"
+            and extra_config.get("spec_name", "CPUOffloadingSpec")
+            == "CPUOffloadingSpec"
+        ):
             return
 
         raise ValueError(
